@@ -1,0 +1,6 @@
+[submodule "cirb"]
+	path = cirb
+	url = https://gitlab.com/lumifaza/cirb
+[submodule "searchfire"]
+	path = searchfire
+	url = https://gitlab.com/lumifaza/searchfire

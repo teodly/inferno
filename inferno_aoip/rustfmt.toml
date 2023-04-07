@@ -1,0 +1,5 @@
+max_width = 106 # magic value to make hex strings have 16 values in line
+use_small_heuristics = "Max"
+imports_granularity = "Crate"
+format_strings = true
+tab_spaces = 2

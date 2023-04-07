@@ -1,0 +1,8 @@
+[workspace]
+
+members = [
+    "inferno_aoip",
+    "cirb",
+    "searchfire",
+    "inferno2pipe"
+]
