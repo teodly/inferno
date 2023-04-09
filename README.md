@@ -8,6 +8,7 @@ However, chances that it'll break already working Dante network are low.
 * receiving audio from Dante devices
 * connections can be made using Dante Controller or [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) (`netaudio` command line tool)
 
+
 ## Quirks, read it before using:
 * Dante protocol is undocumented. Everything was reverse-engineered or based on other reverse-engineering projects. Some things in implementation were guessed. So while it works with my setup, it may not work with yours.
 * channel names can't be changed. If you try to change them, Dante Controller may get confused
@@ -20,6 +21,7 @@ Disclaimer: Dante uses technology patented by Audinate. This source code may use
 * distribute binaries in (or from) a region where software patents apply
 
 This project makes no claim to be either authorized or approved by Audinate.
+
 
 # Quick start - how to record audio?
 1. [install Rust](https://rustup.rs/) and [FFmpeg](http://ffmpeg.org/)
@@ -47,17 +49,28 @@ This project makes no claim to be either authorized or approved by Audinate.
   * Arch
   * Ubuntu
 
+
 # Anatomy of the repository
 * `inferno_aoip` - main library crate for emulating a Dante audio over IP device. In the future controller functionality will also be implemented. **Start here if you want to develop your app based on Inferno**.
 * `inferno2pipe` - capture audio, writing interleaved 32-bit integer samples into an Unix named pipe (or a raw file). Helper script for recording to more convenient format is also provided. **Start here if you want to use Inferno for capturing audio**
 * `searchfire` - fork of [Searchlight](https://github.com/WilliamVenner/searchlight) mDNS crate, modified for compatibility with Dante's mDNS
 * `cirb` - Clock-Indexed Ring-Buffer - fork of [`rt-history`](https://github.com/HadrienG2/rt-history) crate with emphasis on allowing reordered incoming packets and clock synchronization
 
+
 # Environment variables
 * `INFERNO_BIND_IP` - which local IP to bind to. Specifying it may be necessary if you have multiple network interfaces
 * `INFERNO_DEVICE_ID` - 16 hexadecimal digits (8 bytes) used as a device ID. Dante devices usually use MAC address padded with zeros. Inferno uses `0000<IP address>0000` by default. Device ID is the storage key when saving state.
 * `INFERNO_NAME` - name of advertised device. If unspecified, name based on app name and IP address will be generated.
 * `INFERNO_SAMPLE_RATE` - sample rate this device will operate on
+
+
+# Contributing
+Issue reports and pull requests are welcome. However I'm currently taking a break from this project and will be back in June or July 2023.
+
+By submitting any contribution, you agree that it will be distributed according to the comment found at the top of `inferno_aoip/src/lib.rs` file - under the terms of GNU GPL v3 or any later version.
+
+Please use editor respecting `.editorconfig` (for example, VSCode needs an extension: [EditorConfig for VS Code](https://open-vsx.org/extension/EditorConfig/EditorConfig)) or configure it approprietly manually.
+
 
 # To do
 likely in order they'll be implementated
@@ -78,13 +91,16 @@ likely in order they'll be implementated
 * primary & secondary network support, for dual-NIC computers
 * `grep -r TODO inferno_aoip/src`
 
+
 # Design
 * 100% safe Rust
 * no platform-specific code (this may change should it be needed for certain features)
 * no external libraries needed, the only dependencies are Rust crates
 
+
 # Motivation
 I've been using free as in freedom, open source software for many years now. I'm also fascinated by connections between music and technology. One day my sound engineer collegue showed me how Dante works, how easy to use and (most of the time) stable it is. The problem was that it's not an open standard, didn't have open source implementation and I couldn't use it on my favourite operating system - Linux. Now I can.
+
 
 # Other open source projects related to Dante
 * [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) - command line connection and device controller, alternative to Dante Controller

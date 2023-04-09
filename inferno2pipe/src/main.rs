@@ -5,8 +5,25 @@ use clap::Parser;
 
 use inferno_aoip::{Sample, DeviceInfo, DeviceServer, SelfInfoBuilder};
 
+const ABOUT: &str = "Inferno2pipe
+Copyright (C) 2023 Teodor Wozniak
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+";
+
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = ABOUT, long_about = None, arg_required_else_help = true)]
 struct Args {
   #[arg(long, short)]
   channels_count: usize,
@@ -46,5 +63,4 @@ async fn main() {
   let server = DeviceServer::start(self_info, Box::new(write_callback)).await;
   let _ = tokio::signal::ctrl_c().await;
   server.shutdown().await;
-
 }
