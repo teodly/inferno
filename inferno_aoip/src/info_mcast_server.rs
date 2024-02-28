@@ -79,7 +79,7 @@ impl<'s> Multicaster<'s> {
       opcode,
       content,
     );
-    self.seqnum += 1;
+    self.seqnum = self.seqnum.wrapping_add(1);
     self.server.send(&dst, pkt).await;
   }
 

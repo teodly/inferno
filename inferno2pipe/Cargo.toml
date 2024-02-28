@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-env_logger = "0.10.0"
-clap = { version = "4.1.13", features = ["derive"] }
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
 inferno_aoip = { path = "../inferno_aoip" }
-log = "0.4.17"
+log = "0.4"
 
 [dependencies.tokio]
-version = "1.25.0"
+version = "1.36"
 features = [ "signal" ]

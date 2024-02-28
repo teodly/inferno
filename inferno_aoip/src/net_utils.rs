@@ -1,7 +1,7 @@
 use log::{error, info};
 
 use std::{
-  net::{Ipv4Addr, SocketAddr},
+  net::{IpAddr, Ipv4Addr, SocketAddr},
   time::Duration,
 };
 use tokio::{net::UdpSocket, select, sync::broadcast::Receiver, time::sleep};
@@ -111,4 +111,10 @@ impl UdpSocketWrapper {
       error!("send error (ignoring): {e:?}");
     }
   }
+}
+
+pub async fn create_udp_socket(self_ip: Ipv4Addr) -> tokio::io::Result<(UdpSocket, u16)> {
+  let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0)).await?;
+  let port = socket.local_addr()?.port();
+  return Ok((socket, port));
 }

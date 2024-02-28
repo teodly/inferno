@@ -1,3 +1,4 @@
+use crate::common::*;
 use std::sync::Arc;
 
 use crate::device_info::DeviceInfo;
@@ -30,8 +31,18 @@ pub async fn run_server(self_info: Arc<DeviceInfo>, shutdown: BroadcastReceiver<
           content.write_u16(0);
           conn.respond(content.as_bytes()).await;
         }
-        _ => {}
+        other => {
+          error!("received unknown opcode1 {other:#04x}, content {}", hex::encode(request.content()));
+          error!("whole packet: {:?}", hex::encode(request.into_storage()));
+        }
       }
+    } else {
+      error!(
+        "received unknown opcode2 {:#04x}, content {}",
+        request.opcode2().read(),
+        hex::encode(request.content())
+      );
+      error!("whole packet: {:?}", hex::encode(request.into_storage()));
     }
   }
 }

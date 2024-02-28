@@ -1,8 +1,12 @@
 use crate::channels_subscriber::ChannelsSubscriber;
-use crate::samples_collector::SamplesCallback;
+use crate::flows_tx::FlowsTransmitter;
+use crate::media_clock::{async_clock_receiver_to_realtime, start_clock_receiver, ClockOverlay};
+use crate::real_time_box_channel::RealTimeBoxReceiver;
+use crate::samples_collector::{RealTimeSamplesReceiver, SamplesCallback, SamplesCollector};
 use crate::state_storage::StateStorage;
 use futures::{Future, FutureExt};
 use itertools::Itertools;
+use tokio::sync::broadcast::Receiver;
 use tokio::task::JoinHandle;
 
 use std::fs::File;
@@ -11,11 +15,12 @@ use std::mem::size_of;
 use std::env;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::net::IpAddr;
 use std::time::Instant;
 use tokio::sync::{broadcast as broadcast_queue, mpsc};
+use cirb::Input as RBInput;
 
 use crate::device_info::{Channel, DeviceInfo};
 
@@ -24,6 +29,7 @@ use crate::common::*;
 pub trait SelfInfoBuilder {
   fn new_self(app_name: &str, short_app_name: &str, my_ip: Option<Ipv4Addr>) -> DeviceInfo;
   fn make_rx_channels(self, count: usize) -> DeviceInfo;
+  fn make_tx_channels(self, count: usize) -> DeviceInfo;
 }
 
 impl SelfInfoBuilder for DeviceInfo {
@@ -65,7 +71,9 @@ impl SelfInfoBuilder for DeviceInfo {
       model_number: "_000000000000000b".to_owned(),
       rx_channels: vec![],
       tx_channels: vec![],
+      bits_per_sample: 24, // TODO make it configurable
       pcm_type: 0xe,
+      latency_ns: 10_000_000, // TODO make it configurable
       sample_rate,
     }
   }
@@ -75,34 +83,60 @@ impl SelfInfoBuilder for DeviceInfo {
       .collect_vec();
     self
   }
+  fn make_tx_channels(mut self, count: usize) -> DeviceInfo {
+    self.tx_channels = (1..=count)
+      .map(|id| Channel { factory_name: format!("{id:02}"), friendly_name: format!("TX {id}") })
+      .collect_vec();
+    self
+  }
 }
 
 pub struct DeviceServer {
-  self_info: Arc<DeviceInfo>,
+  pub self_info: Arc<DeviceInfo>,
+  tx_inputs: Vec<RBInput<Sample>>,
   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>
 }
 
 impl DeviceServer {
-  pub async fn start(self_info: DeviceInfo, samples_callback: SamplesCallback) -> Self {
-    let state_storage = Arc::new(StateStorage::new(&self_info));
+  pub async fn start_with_recv_callback(self_info: DeviceInfo, samples_callback: SamplesCallback) -> Self {
+    Self::start(self_info, |si: &Arc<DeviceInfo>, _| {
+      SamplesCollector::new_with_callback(si.clone(), Box::new(samples_callback))
+    }).await
+  }
+  pub async fn start_with_realtime_receiver(self_info: DeviceInfo) -> (Self, RealTimeSamplesReceiver, RealTimeBoxReceiver<Option<ClockOverlay>>) {
+    let mut rt_recv = None;
+    let mut clk = None;
+    (Self::start(self_info, |si: &Arc<DeviceInfo>, clkrcv: &broadcast_queue::Sender<ClockOverlay>| {
+      let (col, col_fut, rtr) = SamplesCollector::new_realtime(si.clone(), clkrcv.subscribe());
+      rt_recv = Some(rtr);
+      clk = Some(clkrcv.subscribe());
+      (col, col_fut)
+    }).await, rt_recv.unwrap(), async_clock_receiver_to_realtime(clk.unwrap()))
+  }
+  pub async fn start(self_info: DeviceInfo, create_collector: impl FnOnce(&Arc<DeviceInfo>, &broadcast_queue::Sender<ClockOverlay>) -> (SamplesCollector, Pin<Box<dyn Future<Output = ()> + Send + 'static>>)) -> Self {
     let self_info = Arc::new(self_info);
+    let state_storage = Arc::new(StateStorage::new(&self_info));
     let ref_instant = Instant::now();
 
     let (shutdown_send, shdn_recv1) = broadcast_queue::channel(16);
     let shdn_recv2 = shutdown_send.subscribe();
     let shdn_recv3 = shutdown_send.subscribe();
+    let shdn_recv4 = shutdown_send.subscribe();
     let mdns_handle = crate::mdns_server::start_server(self_info.clone());
-    let (flows_handle, flows_thread) = crate::flows_rx::FlowsReceiver::start(self_info.clone(), ref_instant);
-    let flows_handle = Arc::new(flows_handle);
+
+    let (clock_tx, clock_rx) = broadcast_queue::channel(100);
+    
+    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self_info.clone(), ref_instant);
+    let flows_rx_handle = Arc::new(flows_rx_handle);
+
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.ip_address));
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
 
-    let (samples_collector, samples_collector_worker) =
-      crate::samples_collector::SamplesCollector::new(self_info.clone(), Box::new(samples_callback));
+    let (samples_collector, samples_collector_worker) = create_collector(&self_info, &clock_tx);
     let samples_collector = Arc::new(samples_collector);
     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
       self_info.clone(),
-      flows_handle.clone(),
+      flows_rx_handle.clone(),
       mdns_client,
       mcast_tx,
       samples_collector.clone(),
@@ -110,6 +144,11 @@ impl DeviceServer {
       ref_instant,
     );
     let channels_sub_handle = Arc::new(channels_sub_handle);
+
+    let (flows_tx_handle, tx_inputs, flows_tx_thread) = FlowsTransmitter::start(self_info.clone(), clock_rx);
+
+    start_clock_receiver(clock_tx, shutdown_send.subscribe()).await;
+
     let tasks = [
       tokio::spawn(crate::arc_server::run_server(
         self_info.clone(),
@@ -118,6 +157,7 @@ impl DeviceServer {
       )),
       tokio::spawn(crate::cmc_server::run_server(self_info.clone(), shdn_recv2)),
       tokio::spawn(crate::info_mcast_server::run_server(self_info.clone(), mcast_rx, shdn_recv3)),
+      tokio::spawn(crate::flows_control_server::run_server(self_info.clone(), flows_tx_handle, shdn_recv4)),
       tokio::spawn(channels_sub_worker),
       tokio::spawn(samples_collector_worker),
     ];
@@ -129,20 +169,26 @@ impl DeviceServer {
       info!("shutting down");
       shutdown_send.send(()).unwrap();
       mdns_handle.shutdown().unwrap();
-      flows_handle.shutdown().await;
+      flows_rx_handle.shutdown().await;
       samples_collector.shutdown().await;
       channels_sub_handle1.shutdown().await;
       for task in tasks {
         task.await.unwrap();
       }
-      flows_thread.join().unwrap();
+      flows_rx_thread.join().unwrap();
+      flows_tx_thread.join().unwrap();
       info!("shutdown ok");
     }.boxed();
 
     Self {
       self_info,
+      tx_inputs,
       shutdown_todo
     }
+  }
+
+  pub fn take_tx_inputs(&mut self) -> Vec<RBInput<Sample>> {
+    std::mem::take(&mut self.tx_inputs)
   }
 
   pub async fn shutdown(self) {

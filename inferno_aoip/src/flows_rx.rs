@@ -1,11 +1,13 @@
 use crate::common::*;
 use crate::device_info::DeviceInfo;
 use crate::net_utils::MTU;
+use crate::os_utils::set_current_thread_realtime;
+use crate::samples_utils::*;
+use crate::thread_utils::run_future_in_new_thread;
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
-
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -14,85 +16,14 @@ use std::time::{Duration, Instant};
 use atomic::Ordering;
 use cirb::Input as RBInput;
 use futures::future::select_all;
-use futures::Future;
+use futures::{Future, FutureExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 const KEEPALIVE_CONTENT: [u8; 2] = [0x13, 0x37];
-//const KEEPALIVE_STRING: [u8; 9] = ['K' as u8, 'E' as u8, 'E' as u8, 'P' as u8, 'A' as u8, 'L' as u8, 'I' as u8, 'V' as u8, 'E' as u8];
 
 //pub type PacketCallback = Box<dyn FnMut(SocketAddr, &[u8]) + Send + 'static>;
-
-struct SamplesReader<'a> {
-  bytes: &'a [u8],
-  read_pos: usize,
-  stride: usize,
-  remaining_samples: usize,
-}
-
-impl<'a> SamplesReader<'a> {
-  fn get_next_bytes(&mut self, count: usize) -> Option<&'a [u8]> {
-    if self.read_pos + count > self.bytes.len() {
-      return None;
-    }
-    let r = &self.bytes[self.read_pos..self.read_pos + count];
-    self.read_pos += self.stride;
-    self.remaining_samples -= 1;
-    return Some(r);
-  }
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    let size = self.remaining_samples;
-    (size, Some(size))
-  }
-}
-
-struct S16ReaderIterator<'a>(SamplesReader<'a>);
-struct S24ReaderIterator<'a>(SamplesReader<'a>);
-struct S32ReaderIterator<'a>(SamplesReader<'a>);
-
-impl<'a> Iterator for S16ReaderIterator<'a> {
-  type Item = Sample;
-  fn next(&mut self) -> Option<Sample> {
-    self
-      .0
-      .get_next_bytes(2)
-      .map(|b| (((b[0] as USample) << 24) | ((b[1] as USample) << 16)) as Sample)
-  }
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    self.0.size_hint()
-  }
-}
-impl<'a> ExactSizeIterator for S16ReaderIterator<'a> {}
-
-impl<'a> Iterator for S24ReaderIterator<'a> {
-  type Item = Sample;
-  fn next(&mut self) -> Option<Sample> {
-    self.0.get_next_bytes(3).map(|b| {
-      (((b[0] as USample) << 24) | ((b[1] as USample) << 16) | ((b[2] as USample) << 8)) as Sample
-    })
-  }
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    self.0.size_hint()
-  }
-}
-impl<'a> ExactSizeIterator for S24ReaderIterator<'a> {}
-
-impl<'a> Iterator for S32ReaderIterator<'a> {
-  type Item = Sample;
-  fn next(&mut self) -> Option<Sample> {
-    self.0.get_next_bytes(4).map(|b| {
-      (((b[0] as USample) << 24)
-        | ((b[1] as USample) << 16)
-        | ((b[2] as USample) << 8)
-        | (b[3] as USample)) as Sample
-    })
-  }
-  fn size_hint(&self) -> (usize, Option<usize>) {
-    self.0.size_hint()
-  }
-}
-impl<'a> ExactSizeIterator for S32ReaderIterator<'a> {}
 
 struct Channel {
   sink: RBInput<Sample>,
@@ -186,6 +117,7 @@ impl FlowsReceiverInternal {
   }
   async fn run(&mut self) {
     let mut next_keepalive = Instant::now() + KEEPALIVE_INTERVAL;
+    set_current_thread_realtime(88);
     //let max_reordered_samples = (self.sample_rate/8) as usize;
     loop {
       // TODO check how (in)efficient is this... we have it called thousands of times per second... maybe migrate to mio crate
@@ -236,31 +168,19 @@ impl FlowsReceiverInternal {
 }
 
 pub struct FlowsReceiver {
-  commands_sender: mpsc::Sender<Command>
+  commands_sender: mpsc::Sender<Command>,
 }
 
-impl<'a> FlowsReceiver {
+impl FlowsReceiver {
   async fn run(rx: mpsc::Receiver<Command>, sample_rate: u32, ref_instant: Instant) {
-    let mut internal = FlowsReceiverInternal {
-      commands_receiver: rx,
-      sockets: BTreeMap::new(),
-      sample_rate,
-      ref_instant,
-    };
+    let mut internal =
+      FlowsReceiverInternal { commands_receiver: rx, sockets: BTreeMap::new(), sample_rate, ref_instant };
     internal.run().await;
-  }
-  fn run_sync(rx: mpsc::Receiver<Command>, sample_rate: u32, ref_instant: Instant) {
-    tokio::runtime::Builder::new_current_thread()
-      .thread_name("media flows receiver")
-      .enable_all()
-      .build()
-      .unwrap()
-      .block_on(Self::run(rx, sample_rate, ref_instant));
   }
   pub fn start(self_info: Arc<DeviceInfo>, ref_instant: Instant) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let srate = self_info.sample_rate;
-    let thread_join = std::thread::spawn(move || Self::run_sync(rx, srate, ref_instant));
+    let thread_join = run_future_in_new_thread("flows RX", move || Self::run(rx, srate, ref_instant).boxed_local());
     return (Self { commands_sender: tx }, thread_join);
   }
   pub async fn shutdown(&self) {
@@ -292,12 +212,7 @@ impl<'a> FlowsReceiver {
   pub async fn remove_socket(&self, local_id: usize) {
     self.commands_sender.send(Command::RemoveSocket { id: local_id }).await.log_and_forget();
   }
-  pub async fn connect_channel(
-    &self,
-    local_id: usize,
-    channel_index: usize,
-    sink: RBInput<Sample>,
-  ) {
+  pub async fn connect_channel(&self, local_id: usize, channel_index: usize, sink: RBInput<Sample>) {
     self
       .commands_sender
       .send(Command::ConnectChannel { socket_id: local_id, channel_index, sink })
@@ -311,10 +226,4 @@ impl<'a> FlowsReceiver {
       .await
       .log_and_forget();
   }
-}
-
-pub async fn create_socket(self_ip: Ipv4Addr) -> tokio::io::Result<(UdpSocket, u16)> {
-  let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0)).await?;
-  let port = socket.local_addr()?.port();
-  return Ok((socket, port));
 }

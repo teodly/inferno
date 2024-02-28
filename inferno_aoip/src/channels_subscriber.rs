@@ -1,7 +1,8 @@
+use crate::net_utils::create_udp_socket;
 use crate::samples_collector::SamplesCollector;
 use crate::state_storage::StateStorage;
 use crate::{
-  common::*, flows_rx::create_socket, mdns_client::AdvertisedChannel,
+  common::*, mdns_client::AdvertisedChannel,
   protocol::flows_control::FlowHandle,
 };
 
@@ -146,6 +147,7 @@ struct Flow {
   channels_queues: Vec<Option<SamplesQueue>>,
   tx_channels: Vec<Option<u16>>,
   dbcp1: u16,
+  latency_samples: usize,
   last_packet_time: Arc<AtomicUsize>,
   needs_subscription_info_update: bool,
   creation_time: usize,
@@ -158,6 +160,7 @@ impl Flow {
     total_channels: usize,
     tx_channels: impl IntoIterator<Item = u16>,
     dbcp1: u16,
+    latency_samples: usize,
     now: usize,
   ) -> Flow {
     let chs = vec![0; total_channels];
@@ -171,6 +174,7 @@ impl Flow {
       channels_queues: (0..total_channels).map(|_| None).collect(),
       tx_channels,
       dbcp1,
+      latency_samples,
       last_packet_time: Arc::new(AtomicUsize::new(0)),
       needs_subscription_info_update: true,
       creation_time: now,
@@ -202,6 +206,7 @@ struct ChannelsSubscriberInternal {
   flows: Arc<Mutex<Vec<Option<Flow>>>>,
   flows_recv: Arc<FlowsReceiver>,
   buffered_samples_per_channel: usize,
+  min_latency_ns: usize,
   control_client: Arc<FlowsControlClient>,
   mdns_client: Arc<MdnsClient>,
   subscriptions_info: Arc<RwLock<Vec<Option<SubscriptionInfo>>>>,
@@ -233,6 +238,7 @@ impl ChannelsSubscriberInternal {
       flows: Arc::new(Mutex::new(vec![])),
       flows_recv,
       buffered_samples_per_channel: 524288,
+      min_latency_ns: 12_000_000, // TODO dehardcode
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
       subscriptions_info,
@@ -585,9 +591,10 @@ impl ChannelsSubscriberInternal {
           let flow = Flow::new(
             flow_id,
             first.addr,
-            first.tx_channels_per_flow, /*TODO less*/
+            first.tx_channels_per_flow.min(self.self_info.rx_channels.len()).min(8), /*TODO make it configurable*/
             tx_channels,
             first.dbcp1,
+            first.min_rx_latency_ns.max(self.min_latency_ns) * (self.self_info.sample_rate as usize) / 1_000_000_000,
             self.ref_instant.elapsed().as_secs() as _,
           );
 
@@ -615,7 +622,7 @@ impl ChannelsSubscriberInternal {
           let sample_rate = self.self_info.sample_rate;
           
           let future = async move {
-            let (socket, port) = match create_socket(self_ip).await {
+            let (socket, port) = match create_udp_socket(self_ip).await {
               Ok(v) => v,
               Err(e) => {
                 error!("flow receiver socket creation failed: {e:?}");
@@ -718,9 +725,10 @@ impl ChannelsSubscriberInternal {
           }
           let samples_source =
             flow.channels_queues[remote.channel_in_flow].as_ref().unwrap().source.clone();
+          let latency_samples = flow.latency_samples;
           let samples_collector = self.samples_collector.clone();
           tokio::spawn(async move {
-            samples_collector.connect_channel(chi, samples_source).await;
+            samples_collector.connect_channel(chi, samples_source, latency_samples).await;
           });
           subscription.remote = Some(remote);
           subinfos[chi] = Some(SubscriptionInfo {

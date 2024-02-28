@@ -8,10 +8,10 @@ pub trait LogAndForget {
   fn log_and_forget(&self);
 }
 
-impl<T, E: Display> LogAndForget for Result<T, E> {
+impl<T, E: std::fmt::Debug> LogAndForget for Result<T, E> {
   fn log_and_forget(&self) {
     if let Err(e) = self {
-      warn!("Encountered error {e} at {:?}", std::backtrace::Backtrace::capture());
+      warn!("Encountered error {e:?} at {:?}", std::backtrace::Backtrace::capture());
     }
   }
 }

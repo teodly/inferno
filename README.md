@@ -72,16 +72,29 @@ By submitting any contribution, you agree that it will be distributed according 
 Please use editor respecting `.editorconfig` (for example, VSCode needs an extension: [EditorConfig for VS Code](https://open-vsx.org/extension/EditorConfig/EditorConfig)) or configure it approprietly manually.
 
 
+# Changelog
+## 0.2.0
+* audio transmitter
+* alpha version of Inferno Wired - virtual audio source & sink for PipeWire
+* receiving clock from [Statime](https://github.com/teowoz/statime) modified for PTPv1 and virtual clock support - Linux-only for now (because CLOCK_TAI is Linux-only)
+* increased receive thread priority to reduce chance of OS UDP input queue overflow
+
+
+## 0.1.0
+
+initial release
+
+
 # To do
 likely in order they'll be implementated
 
-* proper PTPv1 clock receiver
 * use multicast flows when available
-* increase receive thread priority to reduce chance of OS UDP input queue overflow
-* improve performance of receiver. Currently it's implemented with coroutines which is not very optimal for processing thousands of packets per second.
-* integration with some existing and established audio server. Maybe JACK?
-* audio transmitter
 * ability to change channel names and settings in Dante Controller
+
+At this point, Inferno will roughly become alternative to Dante Virtual Soundcard.
+
+* improve performance of receiver. Currently it's implemented with coroutines which is not very optimal for processing thousands of packets per second.
+* integration with JACK
 * send statistics (clock, latency, signal levels)
 * ability to work as a clock source (PTP leader)
 * ability to use non-default network ports to allow running multiple instances on a single IP address
@@ -93,8 +106,7 @@ likely in order they'll be implementated
 
 
 # Design
-* 100% safe Rust
-* no platform-specific code (this may change should it be needed for certain features)
+* 99.9% safe Rust (unsafe is required only because PipeWire Rust bindings return raw buffers)
 * no external libraries needed, the only dependencies are Rust crates
 
 

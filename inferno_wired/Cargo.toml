@@ -1,0 +1,15 @@
+[package]
+name = "inferno_wired"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+inferno_aoip = { path = "../inferno_aoip" }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11.2"
+log = "0.4.20"
+pipewire = { version = "0.8", features = [ "v0_3_33", "v0_3_44", "v0_3_45" ] }
+futures-util = "0.3.30"
+tokio = { version = "1.36.0", features = ["sync"] }

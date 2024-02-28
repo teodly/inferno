@@ -26,8 +26,22 @@ use tokio::{
   net::UdpSocket,
   time::{timeout_at, Instant},
 };
+use thiserror::Error;
 
-use crate::protocol::req_resp::{make_packet, req_resp_packet, HEADER_LENGTH};
+use super::req_resp::{make_packet, req_resp_packet, HEADER_LENGTH};
+
+pub const PORT: u16 = 4455;
+
+
+#[derive(Error, Debug)]
+pub enum FlowControlError {
+  #[error("flow not found")]
+  FlowNotFound = 0x0103,
+  #[error("too many TX flows")]
+  TooManyTXFlows = 0x0315,
+  #[error("sample rate mismatch")]
+  SampleRateMismatch = 0x0301
+}
 
 pub struct FlowsControlClient {
   seqnum: AtomicU16,

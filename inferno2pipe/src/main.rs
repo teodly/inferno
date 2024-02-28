@@ -6,7 +6,7 @@ use clap::Parser;
 use inferno_aoip::{Sample, DeviceInfo, DeviceServer, SelfInfoBuilder};
 
 const ABOUT: &str = "Inferno2pipe
-Copyright (C) 2023 Teodor Wozniak
+Copyright (C) 2023-2024 Teodor Wozniak
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -60,7 +60,7 @@ async fn main() {
     output_file.write_all(&buffer[..len]).unwrap_or_else(|e| error!("error writing output: {e:?}"));
   };
 
-  let server = DeviceServer::start(self_info, Box::new(write_callback)).await;
+  let server = DeviceServer::start_with_recv_callback(self_info, Box::new(write_callback)).await;
   let _ = tokio::signal::ctrl_c().await;
   server.shutdown().await;
 }

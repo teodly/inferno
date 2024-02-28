@@ -1,8 +1,9 @@
 [workspace]
+resolver = "2"
 
 members = [
     "inferno_aoip",
     "cirb",
     "searchfire",
-    "inferno2pipe"
-]
+    "inferno2pipe",
+    "inferno_wired"]

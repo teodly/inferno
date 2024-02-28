@@ -124,79 +124,7 @@ pub async fn run_server(
           );
           conn.respond(&content).await;
         }
-        0x2000 => {
-          // Dante Transmitters default names:
-          /*respond(&[
-          /* number of channels, repeated 2x ??? */ 0x04, 0x04,
-          0x00, 0x01, 0x00, 0x07, /* offset of binary descriptor: */ 0x00, 0x2c,
-          /* offset of channel 1 name: */ 0x00, 0x3c,
-          0x00, 0x02, 0x00, 0x07, 0x00, 0x2c,
-          /* offset of channel 2 name: */ 0x00, 0x48,
-          0x00, 0x03, 0x00, 0x07, 0x00, 0x2c,
-          /* offset of channel 3 name: */ 0x00, 0x54,
-          0x00, 0x04, 0x00, 0x07, 0x00, 0x2c,
-          /* offset of channel 4 name: */ 0x00, 0x60,
-          /* binary descriptor: */
-          0x00, 0x00, 0xbb, 0x80, 0x01, 0x01, 0x00, 0x18, 0x04, 0x00, 0x00, 0x18, 0x00, 0x18,
-          /* PCM type: */ 0x00, 0x04,
-          /* 0x3C: channel 1 */
-          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x31, 0x00,
-          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x32, 0x00,
-          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x33, 0x00,
-          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x34, 0x00]);*/
-          let channels_count = self_info.tx_channels.len();
-          let channels_names_total: usize =
-            self_info.tx_channels.iter().map(|ch| ch.factory_name.len() + 1).sum();
-          let mut content = vec![0; 2 + channels_count * 8 + 16 + channels_names_total];
-          content[0] = channels_count as u8;
-          content[1] = channels_count as u8;
-          let mut ch_descr_offset: u16 = HEADER_LENGTH as u16 + 2;
-          let common_descr_offset: u16 = ch_descr_offset + channels_count as u16 * 8;
 
-          let mut descr = ByteBuffer::new();
-          descr.write_u32(self_info.sample_rate);
-          descr.write_bytes(&[
-            0x01,
-            0x01,
-            0x00,
-            0x18,
-            0x04,
-            0x00,
-            0x00,
-            0x18,
-            0x00,
-            0x18,
-            0,
-            self_info.pcm_type,
-          ]);
-          content[common_descr_offset as usize - HEADER_LENGTH as usize..][..16]
-            .clone_from_slice(descr.as_bytes());
-          let mut name_offset: u16 = common_descr_offset + 16;
-          let mut channel_number = 1;
-          for ch in &self_info.tx_channels {
-            content[ch_descr_offset as usize - HEADER_LENGTH..][..8].clone_from_slice(&[
-              0,
-              channel_number,
-              0,
-              7,
-              H(common_descr_offset),
-              L(common_descr_offset),
-              H(name_offset),
-              L(name_offset),
-            ]);
-            write_str_to_buffer(
-              &mut content,
-              (name_offset as usize) - HEADER_LENGTH,
-              ch.factory_name.len(),
-              &ch.factory_name,
-            );
-            channel_number += 1;
-            ch_descr_offset += 8;
-            name_offset += ch.factory_name.len() as u16 + 1;
-          }
-          conn.respond(&content).await;
-          // TODO rewrite this with ByteBuffer
-        }
         0x3000 => {
           // Dante Receivers names and subscriptions:
           /*respond(&[0x02, 0x02,
@@ -221,7 +149,7 @@ pub async fn run_server(
           let remaining = self_info.rx_channels.len() - start_index as usize;
           let limit = 16;
           let in_this_response = min(limit, remaining);
-          trace!("returning {in_this_response} channels starting with index {start_index}");
+          trace!("returning {in_this_response} rx channels starting with index {start_index}");
           let mut response = ByteBuffer::new();
           response.set_endian(Endian::BigEndian);
           //response.write_u8(self_info.rx_channels.len() as u8); // total number of channels(?)
@@ -284,30 +212,129 @@ pub async fn run_server(
           let code = if remaining > in_this_response { 0x8112 } else { 1 };
           conn.respond_with_code(code, response.as_bytes()).await;
         }
+
+        0x2000 => {
+          // Dante Transmitters default names:
+          /*respond(&[
+          /* number of channels, repeated 2x ??? */ 0x04, 0x04,
+          0x00, 0x01, 0x00, 0x07, /* offset of binary descriptor: */ 0x00, 0x2c,
+          /* offset of channel 1 name: */ 0x00, 0x3c,
+          0x00, 0x02, 0x00, 0x07, 0x00, 0x2c,
+          /* offset of channel 2 name: */ 0x00, 0x48,
+          0x00, 0x03, 0x00, 0x07, 0x00, 0x2c,
+          /* offset of channel 3 name: */ 0x00, 0x54,
+          0x00, 0x04, 0x00, 0x07, 0x00, 0x2c,
+          /* offset of channel 4 name: */ 0x00, 0x60,
+          /* binary descriptor: */
+          0x00, 0x00, 0xbb, 0x80, 0x01, 0x01, 0x00, 0x18, 0x04, 0x00, 0x00, 0x18, 0x00, 0x18,
+          /* PCM type: */ 0x00, 0x04,
+          /* 0x3C: channel 1 */
+          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x31, 0x00,
+          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x32, 0x00,
+          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x33, 0x00,
+          0x41, 0x6e, 0x61, 0x6c, 0x6f, 0x67, 0x20, 0x49, 0x6e, 0x20, 0x34, 0x00]);*/
+          let content = request.content();
+          let start_index = make_u16(content[2], content[3]) as usize - 1;
+          let remaining = self_info.tx_channels.len() - start_index as usize;
+          let limit = 16;
+          let in_this_response = min(limit, remaining);
+          trace!("returning {in_this_response} tx channels default names starting with index {start_index}");
+          
+          let channels_names_total: usize =
+            self_info.tx_channels.iter().skip(start_index).take(in_this_response).map(|ch| ch.factory_name.len() + 1).sum();
+          let mut content = vec![0; 2 + in_this_response * 8 + 16 + channels_names_total];
+          content[0] = in_this_response as u8;
+          content[1] = in_this_response as u8;
+          let mut ch_descr_offset: u16 = HEADER_LENGTH as u16 + 2;
+          let common_descr_offset: u16 = ch_descr_offset + in_this_response as u16 * 8;
+
+          let mut descr = ByteBuffer::new();
+          descr.write_u32(self_info.sample_rate);
+          descr.write_bytes(&[
+            0x01,
+            0x01,
+            0x00,
+            0x18,
+            0x04,
+            0x00,
+            0x00,
+            0x18,
+            0x00,
+            0x18,
+            0,
+            self_info.pcm_type,
+          ]);
+          content[common_descr_offset as usize - HEADER_LENGTH as usize..][..16]
+            .clone_from_slice(descr.as_bytes());
+          let mut name_offset: u16 = common_descr_offset + 16;
+          for (i, ch) in self_info
+            .tx_channels
+            .iter()
+            .enumerate()
+            .skip(start_index as usize)
+            .take(in_this_response) {
+            let channel_id = (i + 1) as u16;
+            content[ch_descr_offset as usize - HEADER_LENGTH..][..8].clone_from_slice(&[
+              H(channel_id),
+              L(channel_id),
+              0,
+              7,
+              H(common_descr_offset),
+              L(common_descr_offset),
+              H(name_offset),
+              L(name_offset),
+            ]);
+            write_str_to_buffer(
+              &mut content,
+              (name_offset as usize) - HEADER_LENGTH,
+              ch.factory_name.len(),
+              &ch.factory_name,
+            );
+            ch_descr_offset += 8;
+            name_offset += ch.factory_name.len() as u16 + 1;
+          }
+          let code = if remaining > in_this_response { 0x8112 } else { 1 };
+          conn.respond_with_code(code, &content).await;
+          // TODO rewrite this with ByteBuffer
+        }
         0x2010 => {
           // Dante Transmitters user-specified names:
           /*respond(&[0x04, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x2c, 0x00, 0x02, 0x00, 0x02, 0x00, 0x38, 0x00, 0x03, 0x00, 0x03, 0x00, 0x44, 0x00, 0x04, 0x00, 0x04, 0x00, 0x4d, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46, 0x4f, 0x64, 0x62, 0x69, 0x6f, 0x72, 0x6e, 0x69, 0x6b, 0x2d, 0x4c, 0x00, 0x4f, 0x64, 0x62, 0x69, 0x6f, 0x72, 0x6e, 0x69, 0x6b, 0x2d, 0x52, 0x00, 0x49, 0x6e, 0x74, 0x65, 0x72, 0x63, 0x6f, 0x6d, 0x00, 0x34, 0x00]);*/
+          let content = request.content();
+          let start_index = make_u16(content[2], content[3]) as usize - 1;
+          let remaining = self_info.tx_channels.len() - start_index as usize;
+          let limit = 16;
+          let in_this_response = min(limit, remaining);
+          trace!("returning {in_this_response} tx channels friendly names starting with index {start_index}");
+
           let mut response = ByteBuffer::new();
-          response.write_u8(self_info.tx_channels.len() as u8);
-          response.write_u8(self_info.tx_channels.len() as u8);
+          response.write_u8(in_this_response as u8);
+          response.write_u8(in_this_response as u8);
           let mut strings = ByteBuffer::new();
-          let strings_offset = HEADER_LENGTH + 2 + self_info.tx_channels.len() * 6 + 4;
-          let mut ch_number: u16 = 1;
-          for ch in &self_info.tx_channels {
-            response.write_u16(ch_number);
-            response.write_u16(ch_number);
+          let strings_offset = HEADER_LENGTH + 2 + in_this_response * 6 + 4;
+          for (i, ch) in self_info
+            .tx_channels
+            .iter()
+            .enumerate()
+            .skip(start_index as usize)
+            .take(in_this_response) {
+            let channel_id = (i + 1) as u16;
+            response.write_u16(channel_id);
+            response.write_u16(channel_id);
             response.write_u16((strings.get_wpos() + strings_offset) as u16);
             strings.write_bytes(ch.friendly_name.as_bytes());
             strings.write_u8(0);
-            ch_number += 1;
           }
           response.write_u32(0); // ??? used to be 0,0,0,1, or 1,1,0,9, maybe random memory fragments???
           response.write_bytes(strings.as_bytes());
-          conn.respond(response.as_bytes()).await;
+
+          let code = if remaining > in_this_response { 0x8112 } else { 1 };
+          conn.respond_with_code(code, response.as_bytes()).await;
         }
         0x2200 => {
           // Destinations of this device's Transmitters
         }
+
         0x2201 => {
           // Create multicast TX flow
         }
@@ -315,6 +342,7 @@ pub async fn run_server(
           // ???
           conn.respond(&[0 /*was 2*/, 0x00, 0x00, 0x00, 0x00, 0x00]).await;
         }
+
         0x1100 => {
           // ???
           // looks like something dependent on active connections
@@ -338,6 +366,7 @@ pub async fn run_server(
           //conn.respond(&[0x38, 0x00, 0x38, 0xfd, 0x38, 0xfe, 0x38, 0xff]).await;
           conn.respond(&[0u8; 8]).await;
         }
+
         0x3010 => {
           // subscribe (connect our receiver to remote transmitter)
           // or unsubscribe if tx_*_offset is 0

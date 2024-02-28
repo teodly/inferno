@@ -41,6 +41,7 @@ pub struct AdvertisedChannel {
   pub fpp_min: u16,
   /// maximum Frames Per Packet supported by transmitter (Frame = single samples of all channels)
   pub fpp_max: u16,
+  pub min_rx_latency_ns: usize,
   pub multicast: Option<PointerToMulticast>,
 }
 
@@ -164,6 +165,7 @@ impl MdnsClient {
       dbcp1: parse_int("dbcp1")? as u16,
       fpp_min: fpp2.parse()?,
       fpp_max: fpp1.parse()?,
+      min_rx_latency_ns: parse_int("latency_ns")?,
       multicast,
     });
   }
