@@ -1,4 +1,4 @@
-use crate::net_utils::create_udp_socket;
+use crate::net_utils::create_mio_udp_socket;
 use crate::samples_collector::SamplesCollector;
 use crate::state_storage::StateStorage;
 use crate::{
@@ -187,7 +187,7 @@ impl Flow {
 
 #[derive(Clone, Debug)]
 struct ChannelOtherEnd {
-  flow_index: usize,
+  local_flow_index: usize,
   channel_in_flow: usize,
   tx_channel_id: u16,
 }
@@ -274,7 +274,7 @@ impl ChannelsSubscriberInternal {
     self.samples_collector.disconnect_channel(local_channel_index).await;
     if let Some(subscription) = &self.channels[local_channel_index] {
       if let Some(remote) = subscription.remote.as_ref() {
-        match &mut self.flows.lock().unwrap()[remote.flow_index] {
+        match &mut self.flows.lock().unwrap()[remote.local_flow_index] {
           Some(flow) => {
             flow.channels_refcount[remote.channel_in_flow] -= 1;
           }
@@ -470,7 +470,7 @@ impl ChannelsSubscriberInternal {
                       // here we've found a channel that we need
                       local_channel_indices: channel_index_aliases[lci].clone(),
                       remote: ChannelOtherEnd {
-                        flow_index,
+                        local_flow_index: flow_index,
                         channel_in_flow,
                         tx_channel_id: advch.tx_channel_id,
                       },
@@ -535,7 +535,7 @@ impl ChannelsSubscriberInternal {
                 entry.1.push(ChannelSourceUpdate {
                   local_channel_indices: channel_index_aliases[&lci].clone(),
                   remote: ChannelOtherEnd {
-                    flow_index, channel_in_flow: ch_in_flow, tx_channel_id: advch.tx_channel_id
+                    local_flow_index: flow_index, channel_in_flow: ch_in_flow, tx_channel_id: advch.tx_channel_id
                   }
                 });
                 return false;
@@ -608,7 +608,7 @@ impl ChannelsSubscriberInternal {
             .map(|(i, (&lci, chadv))| ChannelSourceUpdate {
               local_channel_indices: channel_index_aliases[&lci].clone(),
               remote: ChannelOtherEnd {
-                flow_index,
+                local_flow_index: flow_index,
                 channel_in_flow: i,
                 tx_channel_id: chadv.tx_channel_id,
               },
@@ -622,7 +622,7 @@ impl ChannelsSubscriberInternal {
           let sample_rate = self.self_info.sample_rate;
           
           let future = async move {
-            let (socket, port) = match create_udp_socket(self_ip).await {
+            let (socket, port) = match create_mio_udp_socket(self_ip) {
               Ok(v) => v,
               Err(e) => {
                 error!("flow receiver socket creation failed: {e:?}");
@@ -660,7 +660,7 @@ impl ChannelsSubscriberInternal {
             assert_eq!(first.bits_per_sample % 8, 0);
             flows_recv
               .add_socket(
-                flow_id,
+                flow_index,
                 socket,
                 (first.bits_per_sample as usize) / 8,
                 tx_channels.len(),
@@ -710,7 +710,7 @@ impl ChannelsSubscriberInternal {
         for chi in upd.local_channel_indices {
           let subscription = self.channels[chi].as_mut().unwrap();
           let remote = upd.remote.clone();
-          let flow = flows[remote.flow_index].as_mut().unwrap();
+          let flow = flows[remote.local_flow_index].as_mut().unwrap();
           flow.tx_channels[remote.channel_in_flow] = Some(remote.tx_channel_id);
           flow.channels_refcount[remote.channel_in_flow] += 1;
           if flow.channels_queues[remote.channel_in_flow].is_none() {
@@ -718,8 +718,9 @@ impl ChannelsSubscriberInternal {
               cirb::RTHistory::<Sample>::new(self.buffered_samples_per_channel, REORDER_WAIT_SAMPLES).split();
             let flows_recv = self.flows_recv.clone();
             let local_id = flow.local_id;
+            debug_assert!(local_id == remote.local_flow_index+1);
             tokio::spawn(async move {
-              flows_recv.connect_channel(local_id, remote.channel_in_flow, sink).await;
+              flows_recv.connect_channel(remote.local_flow_index, remote.channel_in_flow, sink).await;
             });
             flow.channels_queues[remote.channel_in_flow] = Some(SamplesQueue { source })
           }
@@ -746,7 +747,6 @@ impl ChannelsSubscriberInternal {
     }
     trace!("recv loop exited");
     return true;
-    // </here>
   }
 
   async fn scan_flows(&mut self) -> bool {
@@ -782,7 +782,7 @@ impl ChannelsSubscriberInternal {
                   for (chi, ch) in self.channels.iter_mut().enumerate() {
                     if let Some(chsub) = ch {
                       if chsub.remote.is_some()
-                        && chsub.remote.as_ref().unwrap().flow_index == flow_index
+                        && chsub.remote.as_ref().unwrap().local_flow_index == flow_index
                       {
                         if remove {
                           chsub.remote = None;
@@ -836,7 +836,7 @@ impl ChannelsSubscriberInternal {
                     info!("removing no longer needed flow index={flow_index}, remote={rem_addr:?}");
                     control_client.stop_flow(&rem_addr, dbcp1, handle).await.log_and_forget();
                     // we can safely ignore errors - we remove the socket so keepalive messages won't arrive to the tx so it'll kick us off anyway
-                    flows_recv.remove_socket(flow_id).await;
+                    flows_recv.remove_socket(flow_index).await;
                   }
                   .boxed(),
                 );

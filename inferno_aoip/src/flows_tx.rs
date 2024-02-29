@@ -1,6 +1,6 @@
 use std::borrow::Borrow;
 use std::f64::consts::PI;
-use std::net::SocketAddrV4;
+use std::net::{IpAddr, SocketAddrV4, UdpSocket};
 use std::num::Wrapping;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -11,12 +11,11 @@ use atomic::Ordering;
 use cirb::{wrapped_diff, Clock};
 use futures::FutureExt;
 use itertools::Itertools;
-use rand::rngs::ThreadRng;
-use rand::{thread_rng, Rng};
+use rand::rngs::{SmallRng, ThreadRng};
+use rand::{thread_rng, Rng, SeedableRng};
 use tokio::sync::broadcast;
-use tokio::{net::UdpSocket, select, sync::mpsc};
+use tokio::{select, sync::mpsc};
 
-use crate::net_utils::create_udp_socket;
 use crate::os_utils::set_current_thread_realtime;
 use crate::thread_utils::run_future_in_new_thread;
 use crate::{common::*, DeviceInfo};
@@ -27,6 +26,7 @@ use cirb::Input as RBInput;
 
 pub const FPP_MIN: u16 = 2;
 pub const FPP_MAX: u16 = 32;
+pub const MAX_FLOWS: u32 = 128;
 pub const MAX_CHANNELS_IN_FLOW: u16 = 8;
 pub const KEEPALIVE_TIMEOUT_SECONDS: usize = 4;
 pub const MAX_LAG_SAMPLES: usize = 4800;
@@ -64,16 +64,16 @@ impl Flow {
 enum Command {
   NoOp,
   Shutdown,
-  AddFlow { id: u32, socket: UdpSocket, channel_indices: Vec<Option<usize>>, fpp: usize, bytes_per_sample: usize, expired: Arc<AtomicBool> },
-  RemoveFlow { id: u32 },
-  SetChannels { flow_id: u32, channel_indices: Vec<Option<usize>> },
+  AddFlow { index: usize, socket: UdpSocket, channel_indices: Vec<Option<usize>>, fpp: usize, bytes_per_sample: usize, expired: Arc<AtomicBool> },
+  RemoveFlow { index: usize },
+  SetChannels { index: usize, channel_indices: Vec<Option<usize>> },
   UpdateClockOverlay(ClockOverlay),
 }
 
 struct FlowsTransmitterInternal {
   commands_receiver: mpsc::Receiver<Command>,
   sample_rate: u32,
-  flows: BTreeMap<u32, Flow>,
+  flows: Vec<Option<Flow>>,
   clock: MediaClock,
   channels_sources: Vec<RBOutput<Sample>>,
   send_latency_samples: usize,
@@ -86,14 +86,14 @@ impl FlowsTransmitterInternal {
   }
 
   #[inline(always)]
-  async fn transmit(&mut self, dither_rng: &mut ThreadRng, process_events: bool) {
+  fn transmit(&mut self, dither_rng: &mut SmallRng, process_events: bool) {
     let mut tmp_samples = [0 as Sample; FPP_MAX as usize];
     let mut pbuff = [0u8; MTU];
     let sample_rate = self.sample_rate;
     let max_lag_samples = MAX_LAG_SAMPLES;
     if let Some(now) = self.clock.now_in_timebase(sample_rate as u64) {
       let mut max_missing_samples = 0;
-      for (_, flow) in &mut self.flows {
+      for flow in &mut self.flows.iter_mut().filter_map(|opt|opt.as_mut()) {
         if flow.expired.load(Ordering::Relaxed) {
           continue;
         }
@@ -134,19 +134,26 @@ impl FlowsTransmitterInternal {
               match flow.bytes_per_sample {
                 2 => write_s16_samples(samples, &mut pbuff, start, stride, Some(dither_rng)),
                 3 => write_s24_samples(samples, &mut pbuff, start, stride, Some(dither_rng)),
-                4 => write_s32_samples::<_, ThreadRng>(samples, &mut pbuff, start, stride, None),
+                4 => write_s32_samples::<_, SmallRng>(samples, &mut pbuff, start, stride, None),
                 other => {
                   error!("BUG: unsupported bytes per sample {}", other);
                 }
               }
             }
           }
-          
-          flow.socket.send(&pbuff[0..9 + stride * flow.fpp]).await.log_and_forget();
-          flow.next_ts = flow.next_ts.wrapping_add(flow.fpp);
+          let to_send = 9 + stride * flow.fpp;
+          if let Ok(written) = flow.socket.send(&pbuff[0..to_send]) {
+            if written == to_send {
+              flow.next_ts = flow.next_ts.wrapping_add(flow.fpp);
+            } else {
+              warn!("written {written}, should have {to_send}");
+            }
+          } else {
+            warn!("send returned error");
+          }
         }
         if process_events {
-          if let Ok(_) = flow.socket.try_recv(&mut pbuff) {
+          if let Ok(_) = flow.socket.recv(&mut pbuff) {
             flow.keep_alive(now, sample_rate);
           } else if wrapped_diff(flow.expires, now) < 0 {
             flow.expired.store(true, Ordering::Release);
@@ -165,18 +172,18 @@ impl FlowsTransmitterInternal {
   }
   async fn run(&mut self) {
     let sample_rate = self.sample_rate;
-    let mut dither_rng = thread_rng();
+    let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
     let mut counter = Wrapping(0u32);
     set_current_thread_realtime(89);
     loop {
-      let min_next_ts = self.flows.iter().map(|(_, &ref flow)|flow.next_ts).min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
+      let min_next_ts = self.flows.iter().filter_map(|opt|opt.as_ref()).map(|&ref flow|flow.next_ts).min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
       let sleep_duration = min_next_ts.and_then(|ts|self.clock.system_clock_duration_until(ts, sample_rate as u64)).unwrap_or(std::time::Duration::from_secs(20)).max(MIN_SLEEP);
       let mut process_events = (counter.0%16)==0;
       counter += 1;
 
       let command = if sleep_duration < SELECT_THRESHOLD {
         std::thread::sleep(sleep_duration);
-        self.transmit(&mut dither_rng, process_events).await;
+        self.transmit(&mut dither_rng, process_events);
         if process_events {
           self.commands_receiver.try_recv().unwrap_or(Command::NoOp)
         } else {
@@ -189,7 +196,7 @@ impl FlowsTransmitterInternal {
             recv_opt.unwrap_or(Command::Shutdown)
           },
           _ = tokio::time::sleep(sleep_duration) => {
-            self.transmit(&mut dither_rng, process_events).await;
+            self.transmit(&mut dither_rng, process_events);
             Command::NoOp
           }
         }
@@ -198,27 +205,27 @@ impl FlowsTransmitterInternal {
         Command::Shutdown => {
           break;
         },
-        Command::AddFlow { id, socket, channel_indices, fpp, bytes_per_sample, expired } => {
+        Command::AddFlow { index, socket, channel_indices, fpp, bytes_per_sample, expired } => {
           let mut flow = Flow { socket, channel_indices, next_ts: 0, fpp, bytes_per_sample, expires: 0, expired };
           if let Some(now) = self.now() {
             flow.bootstrap_next_ts(now);
             flow.keep_alive(now, self.sample_rate);
           }
-          let previous = self.flows.insert(id, flow);
+          let previous = std::mem::replace(&mut self.flows[index], Some(flow));
           debug_assert!(previous.is_none());
         },
-        Command::RemoveFlow { id } => {
-          self.flows.remove(&id);
+        Command::RemoveFlow { index } => {
+          self.flows[index] = None; // TODO is freeing memory in realtime thread safe???
         },
-        Command::SetChannels { flow_id, channel_indices } => {
-          self.flows.get_mut(&flow_id).unwrap().channel_indices = channel_indices;
+        Command::SetChannels { index, channel_indices } => {
+          self.flows[index].as_mut().unwrap().channel_indices = channel_indices;
         },
         Command::UpdateClockOverlay(clkovl) => {
           let had_clock = self.clock.is_ready();
           self.clock.update_overlay(clkovl);
           if !had_clock {
             let now = self.now().unwrap();
-            for (_, flow) in &mut self.flows {
+            for flow in &mut self.flows.iter_mut().filter_map(|opt|opt.as_mut()) {
               flow.bootstrap_next_ts(now);
               flow.keep_alive(now, self.sample_rate);
             }
@@ -254,7 +261,7 @@ impl FlowsTransmitter {
     let mut internal = FlowsTransmitterInternal {
       commands_receiver: rx,
       sample_rate,
-      flows: BTreeMap::new(),
+      flows: (0..MAX_FLOWS).map(|_|None).collect_vec(),
       clock: MediaClock::new(),
       channels_sources: channels_outputs,
       send_latency_samples: latency_ns * sample_rate as usize / 1_000_000_000,
@@ -297,7 +304,7 @@ impl FlowsTransmitter {
     return (Self {
       commands_sender: tx,
       self_info: self_info.clone(),
-      flow_seq_id: 1.into(),
+      flow_seq_id: 0.into(),
       flows: BTreeMap::new(),
       ip_port_to_id: BTreeMap::new()
     }, channels_inputs, thread_join);
@@ -306,14 +313,20 @@ impl FlowsTransmitter {
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
   }
 
-  pub async fn add_flow(&mut self, dst_addr: SocketAddr, channel_indices: impl IntoIterator<Item=Option<usize>>, fpp: usize, bytes_per_sample: usize) -> Result<FlowHandle, tokio::io::Error> {
+  pub async fn add_flow(&mut self, dst_addr: SocketAddr, channel_indices: impl IntoIterator<Item=Option<usize>>, fpp: usize, bytes_per_sample: usize) -> Result<FlowHandle, std::io::Error> {
     let (flow_number, cookie) = match self.ip_port_to_id.get(&dst_addr) {
       None => {
         self.scan_expired().await;
+        let mut counter = 0;
         let flow_number = loop {
-          let flow_number = self.flow_seq_id.fetch_add(1, atomic::Ordering::AcqRel);
+          let flow_number = self.flow_seq_id.fetch_add(1, atomic::Ordering::AcqRel) % MAX_FLOWS;
           if !self.flows.contains_key(&flow_number) {
             break flow_number;
+          }
+          counter += 1;
+          if counter > MAX_FLOWS {
+            error!("ran out of flows! {MAX_FLOWS}");
+            return Err(std::io::Error::from(std::io::ErrorKind::OutOfMemory));
           }
         };
         let flow = FlowInfo {
@@ -321,11 +334,12 @@ impl FlowsTransmitter {
           remote: dst_addr.clone(),
           expired: Arc::new(AtomicBool::new(false))
         };
-    
-        let (socket, _port) = create_udp_socket(self.self_info.ip_address).await?;
-        socket.connect(dst_addr).await?;
-    
-        self.commands_sender.send(Command::AddFlow { id: flow_number, socket, channel_indices: channel_indices.into_iter().collect_vec(), fpp, bytes_per_sample, expired: flow.expired.clone() }).await.unwrap();
+        
+        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
+        socket.connect(dst_addr)?;
+        socket.set_nonblocking(true)?;
+        
+        self.commands_sender.send(Command::AddFlow { index: flow_number as usize, socket, channel_indices: channel_indices.into_iter().collect_vec(), fpp, bytes_per_sample, expired: flow.expired.clone() }).await.unwrap();
 
         let cookie = flow.cookie;
         self.flows.insert(flow_number, flow);
@@ -334,7 +348,7 @@ impl FlowsTransmitter {
       Some(&flow_number) => {
         warn!("got add flow request for already existing flow, setting channels instead");
         // TODO FIXME what if fpp or bytes_per_sample change?
-        self.commands_sender.send(Command::SetChannels { flow_id: flow_number, channel_indices: channel_indices.into_iter().collect_vec() }).await.unwrap();
+        self.commands_sender.send(Command::SetChannels { index: flow_number as usize, channel_indices: channel_indices.into_iter().collect_vec() }).await.unwrap();
         (flow_number, self.flows.get(&flow_number).unwrap().cookie)
       }
     };
@@ -355,7 +369,7 @@ impl FlowsTransmitter {
     if let Some(flow) = self.flows.remove(&id) {
       self.ip_port_to_id.remove(&flow.remote);
     }
-    self.commands_sender.send(Command::RemoveFlow { id }).await.unwrap();
+    self.commands_sender.send(Command::RemoveFlow { index: id as usize }).await.unwrap();
   }
   pub async fn remove_flow(&mut self, handle: FlowHandle) -> bool {
     if let Some((id, _)) = self.get_flow(handle) {
@@ -367,7 +381,7 @@ impl FlowsTransmitter {
   }
   pub async fn set_channels(&mut self, handle: FlowHandle, channel_indices: impl IntoIterator<Item=Option<usize>>) -> bool {
     if let Some((id, _)) = self.get_flow(handle) {
-      self.commands_sender.send(Command::SetChannels { flow_id: id, channel_indices: channel_indices.into_iter().collect_vec() }).await.unwrap();
+      self.commands_sender.send(Command::SetChannels { index: id as usize, channel_indices: channel_indices.into_iter().collect_vec() }).await.unwrap();
       true
     } else {
       false

@@ -22,7 +22,7 @@ atomic_enum = "0.2"
 local-ip-address = "0.5"
 cirb = { path = "../cirb" }
 atomic = "0.6"
-rand = "0.8"
+rand = { version="0.8", features=["small_rng"] }
 toml = "0.8"
 platform-dirs = "0.3"
 clock-steering = "0.2"
@@ -31,6 +31,7 @@ interprocess = { version = "1.2", features = ["tokio_support"] }
 thiserror = "1.0.57"
 thread-priority = "0.15"
 atomicbox = "0.4.0"
+mio = { version = "0.8.10", features = ["net", "os-ext", "os-poll"] }
 
 [dependencies.serde]
 version = "1.0.159"

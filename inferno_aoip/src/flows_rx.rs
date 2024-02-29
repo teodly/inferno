@@ -17,9 +17,12 @@ use atomic::Ordering;
 use cirb::Input as RBInput;
 use futures::future::select_all;
 use futures::{Future, FutureExt};
-use tokio::net::UdpSocket;
+use itertools::Itertools;
+use mio::net::UdpSocket;
 use tokio::sync::mpsc;
 
+pub const MAX_FLOWS: usize = 128;
+const WAKE_TOKEN: mio::Token = mio::Token(MAX_FLOWS);
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 const KEEPALIVE_CONTENT: [u8; 2] = [0x13, 0x37];
 
@@ -34,40 +37,36 @@ struct SocketData {
   last_source: Option<SocketAddr>,
   last_packet_time: Arc<AtomicUsize>,
   bytes_per_sample: usize,
-  //callback: PacketCallback,
   channels: Vec<Option<Channel>>,
 }
 
 enum Command {
   NoOp,
   Shutdown,
-  AddSocket { id: usize, socket: SocketData },
-  RemoveSocket { id: usize },
-  ConnectChannel { socket_id: usize, channel_index: usize, sink: RBInput<Sample> },
-  DisconnectChannel { socket_id: usize, channel_index: usize },
+  AddSocket { index: usize, socket: SocketData },
+  RemoveSocket { index: usize },
+  ConnectChannel { socket_index: usize, channel_index: usize, sink: RBInput<Sample> },
+  DisconnectChannel { socket_index: usize, channel_index: usize },
 }
 
 struct FlowsReceiverInternal {
   commands_receiver: mpsc::Receiver<Command>,
-  sockets: BTreeMap<usize, SocketData>,
+  poll: mio::Poll,
+  sockets: Vec<Option<SocketData>>,
   sample_rate: u32,
   ref_instant: Instant,
 }
 
 impl FlowsReceiverInternal {
-  async fn receive(sd: &mut SocketData, sample_rate: u32, ref_instant: Instant) -> Command {
+  fn receive(sd: &mut SocketData, sample_rate: u32, ref_instant: Instant) -> Command {
     let mut buf = [0; MTU];
-    match sd.socket.recv_from(&mut buf).await {
+    match sd.socket.recv_from(&mut buf) {
       Ok((recv_size, src)) => {
         if recv_size < 9 {
           error!("received corrupted (too small) packet on flow socket");
           return Command::NoOp;
         }
-        /*let num_channels = buf[0] as usize;
-        if num_channels != sd.channels.len() {
-          error!("received {num_channels} channels but this flow has {}", sd.channels.len());
-          return Command::NoOp;
-        }*/
+
         let num_channels = sd.channels.len();
         sd.last_packet_time.store(ref_instant.elapsed().as_secs() as _, Ordering::Relaxed);
 
@@ -78,7 +77,7 @@ impl FlowsReceiverInternal {
           .wrapping_mul(sample_rate as usize)
           .wrapping_add(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize);
 
-        // TODO: add timestamp sanity checks (when proper PTP clock receiver is implemented)
+        // TODO: add timestamp sanity checks with PTP clock
 
         let stride = num_channels * sd.bytes_per_sample;
         let samples_count = audio_bytes.len() / stride;
@@ -115,44 +114,49 @@ impl FlowsReceiverInternal {
   async fn take_command(receiver: &mut mpsc::Receiver<Command>) -> Command {
     receiver.recv().await.unwrap_or(Command::Shutdown)
   }
-  async fn run(&mut self) {
+  fn run(&mut self) {
     let mut next_keepalive = Instant::now() + KEEPALIVE_INTERVAL;
+    let mut events = mio::Events::with_capacity(MAX_FLOWS);
     set_current_thread_realtime(88);
-    //let max_reordered_samples = (self.sample_rate/8) as usize;
     loop {
-      // TODO check how (in)efficient is this... we have it called thousands of times per second... maybe migrate to mio crate
-      // TODO OK, 4 flows taking 16% of core (--release build) on i5-2520M (2011), could be better
-      let command_fut_arr = [Box::pin(Self::take_command(&mut self.commands_receiver))
-        as Pin<Box<dyn Future<Output = Command>>>];
-      let recv_iter = self.sockets.iter_mut().map(|(_id, sd)| {
-        Box::pin(Self::receive(sd, self.sample_rate, self.ref_instant))
-          as Pin<Box<dyn Future<Output = Command>>>
-      });
-      let (command, _, _) = select_all(recv_iter.chain(command_fut_arr)).await;
-      match command {
-        Command::Shutdown => break,
-        Command::AddSocket { id, socket } => {
-          self.sockets.insert(id, socket);
+      self.poll.poll(&mut events, None).log_and_forget();
+      for event in &events {
+        if event.token() == WAKE_TOKEN {
+          let command = self.commands_receiver.try_recv().unwrap_or(Command::NoOp);
+          match command {
+            Command::Shutdown => break,
+            Command::AddSocket { index: id, mut socket } => {
+              self.poll.registry().register(&mut socket.socket, mio::Token(id), mio::Interest::READABLE).unwrap();
+              let previous = std::mem::replace(&mut self.sockets[id], Some(socket));
+              debug_assert!(previous.is_none());
+            }
+            Command::RemoveSocket { index: id } => {
+              self.poll.registry().deregister(&mut self.sockets[id].as_mut().unwrap().socket);
+              self.sockets[id] = None;
+            }
+            Command::ConnectChannel { socket_index: socket_id, channel_index, sink } => {
+              self.sockets[socket_id].as_mut().unwrap().channels[channel_index] = Some(Channel { sink });
+            }
+            Command::DisconnectChannel { socket_index: socket_id, channel_index } => {
+              self.sockets[socket_id].as_mut().unwrap().channels[channel_index] = None;
+            }
+            Command::NoOp => {}
+          };
+        } else {
+          let socket_index = event.token().0;
+          if let Some(socket_data) = &mut self.sockets[socket_index] {
+            Self::receive(socket_data, self.sample_rate, self.ref_instant);
+          } else {
+            warn!("got token not bound to any existing socket");
+          }
         }
-        Command::RemoveSocket { id } => {
-          self.sockets.remove(&id);
-        }
-        Command::ConnectChannel { socket_id, channel_index, sink } => {
-          let sd = self.sockets.get_mut(&socket_id).unwrap();
-          //assert!(sd.channels[channel_index].is_none());
-          sd.channels[channel_index] = Some(Channel { sink });
-        }
-        Command::DisconnectChannel { socket_id, channel_index } => {
-          let sd = self.sockets.get_mut(&socket_id).unwrap();
-          sd.channels[channel_index] = None;
-        }
-        Command::NoOp => {}
-      };
+      }
+      
       let now = Instant::now();
       if now >= next_keepalive {
-        for (_, sd) in &self.sockets {
+        for sd in self.sockets.iter().filter_map(|opt|opt.as_ref()) {
           if let Some(src) = sd.last_source {
-            if let Err(e) = sd.socket.send_to(&KEEPALIVE_CONTENT, src).await {
+            if let Err(e) = sd.socket.send_to(&KEEPALIVE_CONTENT, src) {
               error!("failed to send keepalive to {src:?}: {e:?}");
             }
           }
@@ -169,26 +173,31 @@ impl FlowsReceiverInternal {
 
 pub struct FlowsReceiver {
   commands_sender: mpsc::Sender<Command>,
+  waker: mio::Waker
 }
 
 impl FlowsReceiver {
-  async fn run(rx: mpsc::Receiver<Command>, sample_rate: u32, ref_instant: Instant) {
+  fn run(rx: mpsc::Receiver<Command>, poll: mio::Poll, sample_rate: u32, ref_instant: Instant) {
     let mut internal =
-      FlowsReceiverInternal { commands_receiver: rx, sockets: BTreeMap::new(), sample_rate, ref_instant };
-    internal.run().await;
+      FlowsReceiverInternal { commands_receiver: rx, sockets: (0..MAX_FLOWS).map(|_|None).collect_vec(), poll, sample_rate, ref_instant };
+    internal.run();
   }
   pub fn start(self_info: Arc<DeviceInfo>, ref_instant: Instant) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
+    let poll = mio::Poll::new().unwrap();
+    let waker = mio::Waker::new(poll.registry(), WAKE_TOKEN).unwrap();
     let srate = self_info.sample_rate;
-    let thread_join = run_future_in_new_thread("flows RX", move || Self::run(rx, srate, ref_instant).boxed_local());
-    return (Self { commands_sender: tx }, thread_join);
+    let thread_join = std::thread::Builder::new().name("flows RX".to_owned()).spawn(move || {
+      Self::run(rx, poll, srate, ref_instant);
+    }).unwrap();
+    return (Self { commands_sender: tx, waker }, thread_join);
   }
   pub async fn shutdown(&self) {
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
   }
   pub async fn add_socket(
     &self,
-    local_id: usize,
+    local_index: usize,
     socket: UdpSocket,
     bytes_per_sample: usize,
     channels_count: usize,
@@ -197,7 +206,7 @@ impl FlowsReceiver {
     self
       .commands_sender
       .send(Command::AddSocket {
-        id: local_id,
+        index: local_index,
         socket: SocketData {
           socket,
           last_source: None,
@@ -208,22 +217,26 @@ impl FlowsReceiver {
       })
       .await
       .log_and_forget();
+    self.waker.wake().log_and_forget();
   }
-  pub async fn remove_socket(&self, local_id: usize) {
-    self.commands_sender.send(Command::RemoveSocket { id: local_id }).await.log_and_forget();
+  pub async fn remove_socket(&self, local_index: usize) {
+    self.commands_sender.send(Command::RemoveSocket { index: local_index }).await.log_and_forget();
+    self.waker.wake().log_and_forget();
   }
-  pub async fn connect_channel(&self, local_id: usize, channel_index: usize, sink: RBInput<Sample>) {
+  pub async fn connect_channel(&self, local_index: usize, channel_index: usize, sink: RBInput<Sample>) {
     self
       .commands_sender
-      .send(Command::ConnectChannel { socket_id: local_id, channel_index, sink })
+      .send(Command::ConnectChannel { socket_index: local_index, channel_index, sink })
       .await
       .log_and_forget();
+    self.waker.wake().log_and_forget();
   }
-  pub async fn disconnect_channel(&self, local_id: usize, channel_index: usize) {
+  pub async fn disconnect_channel(&self, local_index: usize, channel_index: usize) {
     self
       .commands_sender
-      .send(Command::DisconnectChannel { socket_id: local_id, channel_index })
+      .send(Command::DisconnectChannel { socket_index: local_index, channel_index })
       .await
       .log_and_forget();
+    self.waker.wake().log_and_forget();
   }
 }

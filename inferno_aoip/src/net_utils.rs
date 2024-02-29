@@ -113,8 +113,14 @@ impl UdpSocketWrapper {
   }
 }
 
-pub async fn create_udp_socket(self_ip: Ipv4Addr) -> tokio::io::Result<(UdpSocket, u16)> {
+pub async fn create_tokio_udp_socket(self_ip: Ipv4Addr) -> tokio::io::Result<(UdpSocket, u16)> {
   let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0)).await?;
+  let port = socket.local_addr()?.port();
+  return Ok((socket, port));
+}
+
+pub fn create_mio_udp_socket(self_ip: Ipv4Addr) -> std::io::Result<(mio::net::UdpSocket, u16)> {
+  let socket = mio::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(self_ip), 0))?;
   let port = socket.local_addr()?.port();
   return Ok((socket, port));
 }
