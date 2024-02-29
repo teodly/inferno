@@ -87,9 +87,10 @@ where F: FnMut(usize, usize, &mut [i32]) + 'static {
         *pw::keys::NODE_FORCE_RATE => "0",
         *pw::keys::NODE_FORCE_QUANTUM => format!("{}", state.frames_per_callback),
         // TODO figure out how to set up resampling as PipeWire does with ALSA, instead of forcing to make us the driver
+        // anyway, in most cases we SHOULD be a driver because Dante devices are always pro-audio so we don't want resampling
         *pw::keys::PRIORITY_DRIVER => dir.select("9000", "8000"),
         *pw::keys::PORT_PHYSICAL => "true", // dunno whether it is needed
-        //*pw::keys::PORT_TERMINAL => "true",
+        *pw::keys::PORT_TERMINAL => "true",
     };
 
     let stream = pw::stream::Stream::new(&core, dir.select("from_network", "to_network"), props)?;

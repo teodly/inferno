@@ -33,7 +33,7 @@ pub const MAX_LAG_SAMPLES: usize = 4800;
 pub const DISCONTINUITY_THRESHOLD_SAMPLES: usize = 192000;
 const BUFFERED_SAMPLES_PER_CHANNEL: usize = 65536;
 pub const SELECT_THRESHOLD: Duration = Duration::from_millis(100);
-pub const MIN_SLEEP: Duration = Duration::from_millis(2); // to save CPU cycles
+pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles
 
 pub type SamplesRequestCallback = Box<dyn FnMut(Clock, usize, &mut [Sample]) + Send + 'static>;
 
@@ -111,8 +111,9 @@ impl FlowsTransmitterInternal {
         pbuff[9..9 + stride * flow.fpp].fill(0);
         while wrapped_diff(now, flow.next_ts) >= 0 {
           pbuff[0] = 2u8; // ???
-          let seconds = flow.next_ts / (sample_rate as Clock);
-          let subsec_samples = flow.next_ts % (sample_rate as Clock);
+          let packet_ts = flow.next_ts.wrapping_sub(flow.fpp); // ???
+          let seconds = packet_ts / (sample_rate as Clock);
+          let subsec_samples = packet_ts % (sample_rate as Clock);
           pbuff[1..5].copy_from_slice(&(seconds as u32).to_be_bytes());
           pbuff[5..9].copy_from_slice(&(subsec_samples as u32).to_be_bytes());
           let start_ts = flow.next_ts.wrapping_sub(flow.fpp).wrapping_sub(self.send_latency_samples);
@@ -338,6 +339,7 @@ impl FlowsTransmitter {
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
         socket.connect(dst_addr)?;
         socket.set_nonblocking(true)?;
+        //socket.set_read_timeout(Some(Duration::from_micros(1)))?;
         
         self.commands_sender.send(Command::AddFlow { index: flow_number as usize, socket, channel_indices: channel_indices.into_iter().collect_vec(), fpp, bytes_per_sample, expired: flow.expired.clone() }).await.unwrap();
 

@@ -131,7 +131,7 @@ impl FlowsReceiverInternal {
               debug_assert!(previous.is_none());
             }
             Command::RemoveSocket { index: id } => {
-              self.poll.registry().deregister(&mut self.sockets[id].as_mut().unwrap().socket);
+              self.poll.registry().deregister(&mut self.sockets[id].as_mut().unwrap().socket).unwrap();
               self.sockets[id] = None;
             }
             Command::ConnectChannel { socket_index: socket_id, channel_index, sink } => {
