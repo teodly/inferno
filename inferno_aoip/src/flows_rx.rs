@@ -20,6 +20,7 @@ use futures::{Future, FutureExt};
 use itertools::Itertools;
 use mio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
 
 pub const MAX_FLOWS: usize = 128;
 const WAKE_TOKEN: mio::Token = mio::Token(MAX_FLOWS);
@@ -117,13 +118,25 @@ impl FlowsReceiverInternal {
   fn run(&mut self) {
     let mut next_keepalive = Instant::now() + KEEPALIVE_INTERVAL;
     let mut events = mio::Events::with_capacity(MAX_FLOWS);
+    let mut may_have_command = false;
     set_current_thread_realtime(88);
     loop {
-      self.poll.poll(&mut events, None).log_and_forget();
+      self.poll.poll(&mut events, if may_have_command { Some(Duration::from_millis(1)) } else { None }).log_and_forget();
       for event in &events {
         if event.token() == WAKE_TOKEN {
-          let command = self.commands_receiver.try_recv().unwrap_or(Command::NoOp);
-          match command {
+          may_have_command = true;
+        } else {
+          let socket_index = event.token().0;
+          if let Some(socket_data) = &mut self.sockets[socket_index] {
+            Self::receive(socket_data, self.sample_rate, self.ref_instant);
+          } else {
+            warn!("got token not bound to any existing socket");
+          }
+        }
+      }
+      if may_have_command {
+        match self.commands_receiver.try_recv() {
+          Ok(command) => match command {
             Command::Shutdown => break,
             Command::AddSocket { index: id, mut socket } => {
               self.poll.registry().register(&mut socket.socket, mio::Token(id), mio::Interest::READABLE).unwrap();
@@ -141,15 +154,14 @@ impl FlowsReceiverInternal {
               self.sockets[socket_id].as_mut().unwrap().channels[channel_index] = None;
             }
             Command::NoOp => {}
-          };
-        } else {
-          let socket_index = event.token().0;
-          if let Some(socket_data) = &mut self.sockets[socket_index] {
-            Self::receive(socket_data, self.sample_rate, self.ref_instant);
-          } else {
-            warn!("got token not bound to any existing socket");
           }
-        }
+          Err(TryRecvError::Empty) => {
+            may_have_command = false;
+          },
+          Err(TryRecvError::Disconnected) => {
+            break;
+          }
+        };
       }
       
       let now = Instant::now();
@@ -203,6 +215,7 @@ impl FlowsReceiver {
     channels_count: usize,
     last_packet_time_arc: Arc<AtomicUsize>,
   ) {
+    debug!("adding flow receiver local index={local_index}");
     self
       .commands_sender
       .send(Command::AddSocket {
@@ -220,10 +233,12 @@ impl FlowsReceiver {
     self.waker.wake().log_and_forget();
   }
   pub async fn remove_socket(&self, local_index: usize) {
+    debug!("removing flow receiver local index={local_index}");
     self.commands_sender.send(Command::RemoveSocket { index: local_index }).await.log_and_forget();
     self.waker.wake().log_and_forget();
   }
   pub async fn connect_channel(&self, local_index: usize, channel_index: usize, sink: RBInput<Sample>) {
+    debug!("connecting channel: flow index={local_index}, channel in flow: {channel_index}");
     self
       .commands_sender
       .send(Command::ConnectChannel { socket_index: local_index, channel_index, sink })
@@ -232,6 +247,7 @@ impl FlowsReceiver {
     self.waker.wake().log_and_forget();
   }
   pub async fn disconnect_channel(&self, local_index: usize, channel_index: usize) {
+    debug!("disconnecting channel: flow index={local_index}, channel in flow: {channel_index}");
     self
       .commands_sender
       .send(Command::DisconnectChannel { socket_index: local_index, channel_index })
