@@ -111,12 +111,12 @@ impl FlowsTransmitterInternal {
         pbuff[9..9 + stride * flow.fpp].fill(0);
         while wrapped_diff(now, flow.next_ts) >= 0 {
           pbuff[0] = 2u8; // ???
-          let packet_ts = flow.next_ts.wrapping_sub(flow.fpp); // ???
+          let packet_ts = flow.next_ts/* .wrapping_sub(flow.fpp) */; // ???
           let seconds = packet_ts / (sample_rate as Clock);
           let subsec_samples = packet_ts % (sample_rate as Clock);
           pbuff[1..5].copy_from_slice(&(seconds as u32).to_be_bytes());
           pbuff[5..9].copy_from_slice(&(subsec_samples as u32).to_be_bytes());
-          let start_ts = flow.next_ts.wrapping_sub(flow.fpp).wrapping_sub(self.send_latency_samples);
+          let start_ts = flow.next_ts.wrapping_sub(self.send_latency_samples);
           for (index_in_flow, &ch_opt) in flow.channel_indices.iter().enumerate() {
             if let Some(ch_index) = ch_opt {
               //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
@@ -219,7 +219,19 @@ impl FlowsTransmitterInternal {
           self.flows[index] = None; // TODO is freeing memory in realtime thread safe???
         },
         Command::SetChannels { index, channel_indices } => {
-          self.flows[index].as_mut().unwrap().channel_indices = channel_indices;
+          let now_opt = self.now();
+          let flow = self.flows[index].as_mut().unwrap();
+          flow.channel_indices = channel_indices;
+          if let Some(now) = now_opt {
+            flow.keep_alive(now, self.sample_rate);
+          }
+          if flow.expired.load(Ordering::Relaxed) {
+            info!("resuscitating expired flow index={index}");
+            if let Some(now) = now_opt {
+              flow.bootstrap_next_ts(now);
+            }
+            flow.expired.store(false, Ordering::Release);
+          }
         },
         Command::UpdateClockOverlay(clkovl) => {
           let had_clock = self.clock.is_ready();
@@ -301,7 +313,7 @@ impl FlowsTransmitter {
       cirb::RTHistory::<Sample>::new(BUFFERED_SAMPLES_PER_CHANNEL, 0).split()
     }).unzip();
     // TODO dehardcode latency_ns
-    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 12_000_000, channels_outputs).boxed_local());
+    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 10_000_000, channels_outputs).boxed_local());
     return (Self {
       commands_sender: tx,
       self_info: self_info.clone(),

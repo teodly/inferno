@@ -58,7 +58,7 @@ impl Direction {
 }
 
 fn create_stream<F>(dir: Direction, core: &pw::core::Core, app_name: &str, sample_rate: u32, num_channels: u32, state: Arc<StreamState>, mut process_channel_cb: F) -> Result<(Stream, StreamListener<UserData>), pw::Error>
-where F: FnMut(usize, usize, &mut [i32]) + 'static {
+where F: FnMut(usize, usize, &mut [i32]) -> bool + 'static {
     let data = UserData {
         format: Default::default()
     };
@@ -177,13 +177,20 @@ where F: FnMut(usize, usize, &mut [i32]) + 'static {
                             let (left, samples, _right) = unsafe { bytes.align_to_mut::<i32>() };
                             assert_eq!(left.len(), 0, "{dir:?} got unaligned buffer from pipewire");
         
-                            process_channel_cb(start_ts, c as usize, &mut samples[0..n_samples]);
-                        }
-                        if dir == Direction::FromNetwork {
-                            let chunk = data.chunk_mut();
-                            *chunk.offset_mut() = 0;
-                            *chunk.stride_mut() = mem::size_of::<i32>() as _;
-                            *chunk.size_mut() = (mem::size_of::<i32>() * n_samples) as _;
+                            let good = process_channel_cb(start_ts, c as usize, &mut samples[0..n_samples]);
+                            if dir == Direction::FromNetwork {
+                                let chunk = data.chunk_mut();
+                                *chunk.offset_mut() = 0;
+                                
+                                if good {
+                                    *chunk.stride_mut() = mem::size_of::<i32>() as _;
+                                    *chunk.size_mut() = (mem::size_of::<i32>() * n_samples) as _;
+                                } else {
+                                    *chunk.stride_mut() = 0;
+                                    *chunk.size_mut() = 0; // oops
+                                    //log::error!("oops, not giving samples to pipewire");
+                                }
+                            }
                         }
                     }
                 }
@@ -272,7 +279,7 @@ pub fn main() -> Result<(), pw::Error> {
             log::warn!("waiting for clock");
             std::thread::sleep(Duration::from_secs(1));
         }
-    };
+    }.wrapping_add(sample_rate as usize / 2);
 
     let from_network_state = Arc::new(StreamState {
         next_ts: next_ts.into(),
@@ -282,7 +289,7 @@ pub fn main() -> Result<(), pw::Error> {
     });
 
     let from_network_stream = match create_stream(Direction::FromNetwork, &core, &self_info.friendly_hostname, sample_rate, rx_channels as u32, from_network_state.clone(), move |start_ts, channel_index, mut samples| {
-        samples_receiver.get_samples(start_ts, channel_index, &mut samples);
+        samples_receiver.get_samples(start_ts, channel_index, &mut samples)
     }) {
         Ok((stream, stream_listener)) => {
             Box::leak(Box::new(stream_listener));
@@ -302,6 +309,7 @@ pub fn main() -> Result<(), pw::Error> {
     });
     let to_network_stream = match create_stream(Direction::ToNetwork, &core, &self_info.friendly_hostname, sample_rate, tx_channels as u32, to_network_state.clone(), move |start_ts, channel_index, samples| {
         tx_inputs[channel_index].write_from_at(start_ts, samples[0..].into_iter().map(|e|*e));
+        true
     }) {
         Ok((stream, stream_listener)) => {
             Box::leak(Box::new(stream_listener));
@@ -332,7 +340,7 @@ pub fn main() -> Result<(), pw::Error> {
         
         std::thread::Builder::new().name("pw trigger".to_owned()).spawn_scoped(s, move || {
             #[inline(always)]
-            fn handle_state(dir: Direction, now: usize, state: &StreamState) -> isize {
+            fn handle_state(dir: Direction, now: usize, state: &StreamState, allow_catch_up: bool) -> isize {
                 let remaining = state.remaining_process.load(Ordering::Acquire); // FIXME it doesn't work
                 /*if remaining < 0 {
                     log::error!("BUG: pipewire process called more times than trigger_process: {remaining}");
@@ -347,26 +355,25 @@ pub fn main() -> Result<(), pw::Error> {
                         log::warn!("pipewire is calling us with drift {drift} samples ({})", if drift<0 {"too early"} else {"too late"});
                     }
                 }*/
-                let too_late = match dir {
-                    Direction::FromNetwork => drift > (state.frames_per_callback as isize)*2,
-                    Direction::ToNetwork => drift > (state.frames_per_callback as isize)
-                };
+                let too_late = drift > (state.frames_per_callback as isize);
                 if drift.abs() > 48000/4 {
                     log::error!("{dir:?} large clock drift detected, dropping some samples!");
                     state.next_ts.store(now, Ordering::Release);
                 } else if (!waiting) && too_late {
-                    log::warn!("{dir:?} catching up");
-                    //state.to_catchup.fetch_add(((drift as usize / state.frames_per_callback - 1) * state.frames_per_callback) as isize, Ordering::AcqRel);
-                    //state.to_catchup.fetch_add((drift as usize - state.frames_per_callback) as isize, Ordering::AcqRel);
-                    trig_count += 1;
+                    if allow_catch_up {
+                        log::warn!("{dir:?} catching up");
+                        trig_count += 1;
+                    } else {
+                        log::error!("tried but failed to catch up, dropping some samples!");
+                        state.next_ts.store(now, Ordering::Release);
+                    }
                 }
-                let too_early = (!too_late) && match dir {
-                    Direction::FromNetwork => drift < 0 /* (state.frames_per_callback as isize) */,
-                    Direction::ToNetwork => drift < -(state.frames_per_callback as isize)
-                };
+                let too_early = (!too_late) && drift < 0;;
                 if !too_early {
                     // do not call if realtime thread is too early - we may try to dequeue not yet ready samples then
                     trig_count += 1;
+                } else {
+                    log::warn!("{dir:?} too early");
                 }
                 state.remaining_process.fetch_add(trig_count, Ordering::AcqRel);
                 return trig_count
@@ -378,7 +385,13 @@ pub fn main() -> Result<(), pw::Error> {
             }
             clock.update_overlay(clock_receiver.get().unwrap().clone());
 
+            let mut accel_for = 0;
+            const ACCEL_FOR_MIN: i32 = 3;
+            const ACCEL_FOR_MAX: i32 = 11;
+
             set_current_thread_realtime(88); // TODO dehardcode
+
+            sleep(clock.system_clock_duration_until(next_ts, sample_rate as u64).unwrap());
 
             let mut next_wakeup = clock.now_in_timebase(sample_rate as u64).unwrap();
             
@@ -396,8 +409,16 @@ pub fn main() -> Result<(), pw::Error> {
                         next_wakeup = clock.now_in_timebase(sample_rate as u64).unwrap();
                     }
 
-                    let from_network_count = handle_state(Direction::FromNetwork, now, &from_network_state);
-                    let to_network_count = handle_state(Direction::ToNetwork, now, &to_network_state);
+                    let allow_catch_up = if accel_for >= ACCEL_FOR_MAX {
+                        log::warn!("tried to catch up {} times, giving up", accel_for - ACCEL_FOR_MIN);
+                        accel_for = 0;
+                        false
+                    } else {
+                        true
+                    };
+
+                    let from_network_count = handle_state(Direction::FromNetwork, now, &from_network_state, allow_catch_up);
+                    let to_network_count = handle_state(Direction::ToNetwork, now, &to_network_state, allow_catch_up);
 
                     if from_network_count > 0 {
                         from_network_stream.trigger_process();
@@ -406,8 +427,13 @@ pub fn main() -> Result<(), pw::Error> {
                         to_network_stream.trigger_process();
                     }
                     let accel = from_network_count > 1 || to_network_count > 1;
-
                     if accel {
+                        accel_for += 1;
+                    } else {
+                        accel_for = 0;
+                    }
+
+                    if accel_for >= ACCEL_FOR_MIN {
                         let half_wakeup = next_wakeup.wrapping_add(frames_per_callback/2);
                         sleep(clock.system_clock_duration_until(half_wakeup, sample_rate as u64).unwrap());
                         if from_network_count > 1 {

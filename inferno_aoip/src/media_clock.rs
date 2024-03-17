@@ -13,6 +13,9 @@ use futures::io::AsyncReadExt;
 use crate::{common::*, real_time_box_channel};
 use crate::real_time_box_channel::RealTimeBoxReceiver;
 
+// it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
+const CLOCK_OFFSET_NS: ClockDiff = -500_000;
+
 #[derive(Clone, Copy, Debug)]
 pub struct ClockOverlay {
   last_sync: Clock,
@@ -68,7 +71,8 @@ impl MediaClock {
   fn now_underlying(&self) -> Clock {
     timestamp_to_clock_value(self.clock.now().unwrap())
   }
-  pub fn update_overlay(&mut self, overlay: ClockOverlay) {
+  pub fn update_overlay(&mut self, mut overlay: ClockOverlay) {
+    overlay.shift = overlay.shift.wrapping_add(CLOCK_OFFSET_NS);
     if let Some(cur_overlay) = self.overlay {
       let ro_now = self.now_underlying();
       let cur_ovl_time = cur_overlay.timestamp_from_underlying(ro_now);

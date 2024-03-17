@@ -27,20 +27,23 @@ impl Channel {
   fn report_lost_samples(&self, timestamp: Clock, num_samples: usize, reason: &str) {
     error!("Lost {num_samples} samples at timestamp {timestamp} in channel id {} ({reason})", self.id);
   }
-  fn read_samples_from_ringbuffer(&mut self, start_timestamp: Clock, buffer: &mut [Sample]) {
+  fn read_samples_from_ringbuffer(&mut self, start_timestamp: Clock, buffer: &mut [Sample]) -> bool {
+    let mut good = true;
     // report holes:
     let holes_count = self.source.holes_count();
     if holes_count != self.prev_holes_count {
       debug!("holes {} -> {}", self.prev_holes_count, holes_count);
       self.report_lost_samples(start_timestamp, buffer.len(), "reorder buffer timeout");
       self.prev_holes_count = holes_count;
+      good = false;
     }
 
     // read samples:
     let r = self.source.read_at(start_timestamp, buffer);
     if r.useful_start_index != 0 {
       if self.was_connected {
-        self.report_lost_samples(start_timestamp, r.useful_start_index, "buffer overrun");
+        self.report_lost_samples(start_timestamp, r.useful_start_index, "buffer underrun or overwritten in the meantime");
+        good = false;
       }
       // clear whatever junk data was contained at the beginning of buffer
       for sample in &mut buffer[0..r.useful_start_index] {
@@ -53,11 +56,16 @@ impl Channel {
     if r.useful_end_index != buffer.len() {
       if self.was_connected {
         self.report_lost_samples( start_timestamp.wrapping_add(r.useful_end_index), buffer.len()-r.useful_end_index, "buffer underrun");
+        good = false;
       }
       for sample in &mut buffer[r.useful_end_index..] {
         *sample = 0;
       }
     }
+    if !good {
+      warn!("wanted {start_timestamp}..{} but has ..{}", start_timestamp + buffer.len(), self.source.readable_until().unwrap_or(0));
+    }
+    good
   }
 }
 
@@ -68,14 +76,15 @@ pub struct RealTimeSamplesReceiver {
 }
 
 impl RealTimeSamplesReceiver {
-  pub fn get_samples(&mut self, start_timestamp: Clock, channel_index: usize, buffer: &mut [Sample]) {
+  pub fn get_samples(&mut self, start_timestamp: Clock, channel_index: usize, buffer: &mut [Sample]) -> bool {
     let chrecv = &mut self.channels[channel_index];
     chrecv.update();
     if let Some(ch) = chrecv.get_mut() {
       let start_timestamp = start_timestamp.wrapping_sub(ch.latency_samples).wrapping_sub(buffer.len());
-      ch.read_samples_from_ringbuffer(start_timestamp, buffer);
+      ch.read_samples_from_ringbuffer(start_timestamp, buffer)
     } else {
       buffer.fill(0);
+      true
     }
   }
   pub fn clock(&mut self) -> &MediaClock {
