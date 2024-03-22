@@ -25,7 +25,8 @@ use cirb::Output as RBOutput;
 use cirb::Input as RBInput;
 
 pub const FPP_MIN: u16 = 2;
-pub const FPP_MAX: u16 = 32;
+pub const FPP_MAX: u16 = 256;
+pub const FPP_MAX_ADVERTISED: u16 = 32;
 pub const MAX_FLOWS: u32 = 128;
 pub const MAX_CHANNELS_IN_FLOW: u16 = 8;
 pub const KEEPALIVE_TIMEOUT_SECONDS: usize = 4;
@@ -313,7 +314,7 @@ impl FlowsTransmitter {
       cirb::RTHistory::<Sample>::new(BUFFERED_SAMPLES_PER_CHANNEL, 0).split()
     }).unzip();
     // TODO dehardcode latency_ns
-    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 10_000_000, channels_outputs).boxed_local());
+    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 30_000_000, channels_outputs).boxed_local());
     return (Self {
       commands_sender: tx,
       self_info: self_info.clone(),

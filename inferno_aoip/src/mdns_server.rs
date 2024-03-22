@@ -5,7 +5,7 @@ use searchfire::{
 };
 use std::{net::IpAddr, sync::Arc};
 
-use crate::device_info::DeviceInfo;
+use crate::{device_info::DeviceInfo, flows_tx::FPP_MAX_ADVERTISED};
 use crate::protocol::{proto_arc::PORT as ARC_PORT, proto_cmc::PORT as CMC_PORT, flows_control::PORT as FLOWS_CONTROL_PORT};
 use crate::flows_tx::{FPP_MIN, FPP_MAX, MAX_CHANNELS_IN_FLOW};
 
@@ -68,7 +68,7 @@ pub fn start_server(self_info: Arc<DeviceInfo>) -> BroadcasterHandle {
         .add_txt_truncated(kv("enc", self_info.bits_per_sample))
         .add_txt_truncated(kv("en", self_info.bits_per_sample))
         .add_txt_truncated(kv("latency_ns", self_info.latency_ns))
-        .add_txt_truncated(format!("fpp={},{}", FPP_MAX, FPP_MIN))
+        .add_txt_truncated(format!("fpp={},{}", FPP_MAX_ADVERTISED, FPP_MIN))
         .add_txt_truncated(kv("nchan", MAX_CHANNELS_IN_FLOW.min(self_info.tx_channels.len() as u16)));
       if default {
         b = b.add_txt_truncated("default");

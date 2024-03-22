@@ -238,7 +238,7 @@ impl ChannelsSubscriberInternal {
       flows: Arc::new(Mutex::new(vec![])),
       flows_recv,
       buffered_samples_per_channel: 524288,
-      min_latency_ns: 10_000_000, // TODO dehardcode
+      min_latency_ns: 30_000_000, // TODO dehardcode
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
       subscriptions_info,

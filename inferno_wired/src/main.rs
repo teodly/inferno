@@ -15,6 +15,7 @@ use spa::param::format_utils;
 use spa::pod::Pod;
 #[cfg(feature = "v0_3_44")]
 use spa::WritableDict;
+use std::cell::RefCell;
 use std::convert::TryInto;
 use std::ops::Deref;
 use std::thread::sleep;
@@ -57,8 +58,9 @@ impl Direction {
     }
 }
 
-fn create_stream<F>(dir: Direction, core: &pw::core::Core, app_name: &str, sample_rate: u32, num_channels: u32, state: Arc<StreamState>, mut process_channel_cb: F) -> Result<(Stream, StreamListener<UserData>), pw::Error>
-where F: FnMut(usize, usize, &mut [i32]) -> bool + 'static {
+fn create_stream<FGetNumFrames, FProcessBuffer>(dir: Direction, core: &pw::core::Core, app_name: &str, sample_rate: u32, num_channels: u32, state: Arc<StreamState>, mut get_num_frames: FGetNumFrames, mut process_channel_cb: FProcessBuffer) -> Result<(Stream, StreamListener<UserData>), pw::Error>
+where FProcessBuffer: FnMut(usize, usize, &mut [i32]) -> bool + 'static,
+    FGetNumFrames: FnMut(usize) -> usize + 'static {
     let data = UserData {
         format: Default::default()
     };
@@ -75,8 +77,10 @@ where F: FnMut(usize, usize, &mut [i32]) -> bool + 'static {
      * the data.
      */
     let props = properties! {
-        "clock.name" => dir.select("network.inferno.from_network", "network.inferno.to_network"),
-        "clock.id" => dir.select("network.inferno.from_network", "network.inferno.to_network"),
+        /* "clock.name" => dir.select("network.inferno.from_network", "network.inferno.to_network"),
+        "clock.id" => dir.select("network.inferno.from_network", "network.inferno.to_network"), */
+        "clock.name" => "network.inferno",
+        "clock.id" => "network.inferno",
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => dir.select("Playback", "Capture"),
         *pw::keys::MEDIA_ROLE => "Production",
@@ -143,25 +147,25 @@ where F: FnMut(usize, usize, &mut [i32]) -> bool + 'static {
                         return;
                     }
                     let n_channels = user_data.format.channels();
-                    
+                    let n_frames_internal = get_num_frames(state.next_ts.load(Ordering::Acquire));
                     let n_samples_opt = match dir {
                         Direction::FromNetwork => datas.iter_mut().take(n_channels as usize).filter_map(|data|data.data()).map(|bytes|bytes.len()/mem::size_of::<i32>()).min(),
                         Direction::ToNetwork => datas.iter_mut().take(n_channels as usize).map(|data|data.chunk().size() as usize/mem::size_of::<i32>()).min()
                     };
                     let max_n_samples = n_samples_opt.unwrap_or(0);
                     let mut n_samples = match dir {
-                        Direction::FromNetwork => max_n_samples.min(state.frames_per_callback),
+                        Direction::FromNetwork => max_n_samples.min(n_frames_internal),
                         Direction::ToNetwork => max_n_samples
                     };
                     if n_samples == 0 {
                         log::warn!("{dir:?} pipewire gave us buffer of 0 frames");
                         return;
-                    } else if n_samples != state.frames_per_callback {
-                        log::warn!("{dir:?} pipewire gave us buffer of {n_samples} frames but we want {}", state.frames_per_callback);
+                    } else if n_samples != n_frames_internal {
+                        log::warn!("{dir:?} pipewire gave us buffer of {n_samples} frames but we want {}", n_frames_internal);
                     }
                     let to_catchup = state.to_catchup.load(Ordering::Acquire);
                     if to_catchup > 0 {
-                        let add_samples = to_catchup.min(state.frames_per_callback as isize);
+                        let add_samples = to_catchup.min(n_frames_internal as isize);
                         state.to_catchup.fetch_sub(add_samples, Ordering::AcqRel);
                         log::warn!("{dir:?} catching up: before add: {n_samples}");
                         n_samples = (n_samples + add_samples as usize).min(max_n_samples);
@@ -288,9 +292,16 @@ pub fn main() -> Result<(), pw::Error> {
         frames_per_callback
     });
 
-    let from_network_stream = match create_stream(Direction::FromNetwork, &core, &self_info.friendly_hostname, sample_rate, rx_channels as u32, from_network_state.clone(), move |start_ts, channel_index, mut samples| {
-        samples_receiver.get_samples(start_ts, channel_index, &mut samples)
-    }) {
+    let from_network_stream = match create_stream(Direction::FromNetwork, &core, &self_info.friendly_hostname, sample_rate, rx_channels as u32, from_network_state.clone(),
+        move |_start_ts| {
+            // TODO
+            //samples_receiver.get_available_num_samples(start_ts)
+            frames_per_callback
+        },
+        move |start_ts, channel_index, mut samples| {
+            samples_receiver.get_samples(start_ts, channel_index, &mut samples)
+        }
+    ) {
         Ok((stream, stream_listener)) => {
             Box::leak(Box::new(stream_listener));
             stream
@@ -307,10 +318,15 @@ pub fn main() -> Result<(), pw::Error> {
         remaining_process: 0.into(),
         frames_per_callback
     });
-    let to_network_stream = match create_stream(Direction::ToNetwork, &core, &self_info.friendly_hostname, sample_rate, tx_channels as u32, to_network_state.clone(), move |start_ts, channel_index, samples| {
-        tx_inputs[channel_index].write_from_at(start_ts, samples[0..].into_iter().map(|e|*e));
-        true
-    }) {
+    let to_network_stream = match create_stream(Direction::ToNetwork, &core, &self_info.friendly_hostname, sample_rate, tx_channels as u32, to_network_state.clone(),
+        move |_start_ts| {
+            frames_per_callback
+        },
+        move |start_ts, channel_index, samples| {
+            tx_inputs[channel_index].write_from_at(start_ts, samples[0..].into_iter().map(|e|*e));
+            true
+        }
+    ) {
         Ok((stream, stream_listener)) => {
             Box::leak(Box::new(stream_listener));
             stream
@@ -368,7 +384,7 @@ pub fn main() -> Result<(), pw::Error> {
                         state.next_ts.store(now, Ordering::Release);
                     }
                 }
-                let too_early = (!too_late) && drift < 0;;
+                let too_early = (!too_late) && drift < 0;
                 if !too_early {
                     // do not call if realtime thread is too early - we may try to dequeue not yet ready samples then
                     trig_count += 1;

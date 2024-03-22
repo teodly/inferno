@@ -76,6 +76,19 @@ pub struct RealTimeSamplesReceiver {
 }
 
 impl RealTimeSamplesReceiver {
+  fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
+    get_min_max_end_timestamps(self.channels.iter().map(|chrecv|chrecv.get()))
+  }
+  pub fn get_available_num_samples(&mut self, start_timestamp: Clock) -> usize {
+    self.get_min_max_end_timestamps().map(|(end_ts, _)| {
+      let diff = wrapped_diff(end_ts, start_timestamp);
+      if diff > 0 {
+        diff as Clock
+      } else {
+        0
+      }
+    }).unwrap_or(0)
+  }
   pub fn get_samples(&mut self, start_timestamp: Clock, channel_index: usize, buffer: &mut [Sample]) -> bool {
     let chrecv = &mut self.channels[channel_index];
     chrecv.update();
@@ -156,24 +169,22 @@ struct PeriodicSamplesCollector {
   callback: SamplesCallback,
 }
 
+fn get_min_max_end_timestamps<'a>(channels: impl IntoIterator<Item = &'a Option<Channel>>) -> Option<(Clock, Clock)> {
+  let clocks = channels
+    .into_iter()
+    .filter_map(|opt| opt.as_ref())
+    .map(|ch| ch.source.readable_until())
+    .filter_map(|opt| opt)
+    .collect_vec();
+  Some((
+    clocks.iter().min_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?.to_owned(),
+    clocks.iter().max_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?.to_owned()
+  ))
+}
+
 impl PeriodicSamplesCollector {
-  fn get_end_timestamps(&self) -> impl Iterator<Item = Clock> + '_ {
-    self
-      .channels
-      .iter()
-      .filter_map(|opt| opt.as_ref())
-      .map(|ch| ch.source.readable_until())
-      .filter_map(|opt| opt)
-  }
   fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
-    let clocks = self.get_end_timestamps().collect_vec();
-    if clocks.is_empty() {
-      return None;
-    }
-    return Some((
-      clocks.iter().min_by(|&a, &b| wrapped_diff(*a, *b).cmp(&0)).unwrap().to_owned(),
-      clocks.iter().max_by(|&a, &b| wrapped_diff(*a, *b).cmp(&0)).unwrap().to_owned()
-    ));
+    get_min_max_end_timestamps(&self.channels)
   }
   async fn run(&mut self) {
     let mut clock = None;
