@@ -4,3 +4,6 @@
 [submodule "searchfire"]
 	path = searchfire
 	url = https://gitlab.com/lumifaza/searchfire
+[submodule "alsa-sys-all"]
+	path = alsa-sys-all
+	url = https://gitlab.com/lumifaza/alsa-sys-all

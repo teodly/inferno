@@ -22,4 +22,4 @@ fi
 
 ffmpeg -nostdin -fflags nobuffer -f s32le -sample_rate $srate -channels $num_channels -i $fifo $showvol_flags -c:a pcm_s24le $output_file &
 
-INFERNO_SAMPLE_RATE=$srate RUST_LOG=debug RUST_BACKTRACE=1 cargo run --release -- -c $num_channels -o $fifo
+INFERNO_SAMPLE_RATE=$srate RUST_LOG=debug RUST_BACKTRACE=1 cargo run -- -c $num_channels -o $fifo

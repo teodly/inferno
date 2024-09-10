@@ -3,7 +3,8 @@ resolver = "2"
 
 members = [
     "inferno_aoip",
-    "cirb",
     "searchfire",
     "inferno2pipe",
-    "inferno_wired"]
+    "inferno_wired",
+    "alsa_pcm_inferno",
+]

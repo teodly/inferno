@@ -8,7 +8,6 @@ use std::thread::JoinHandle;
 use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
 
 use atomic::Ordering;
-use cirb::{wrapped_diff, Clock};
 use futures::FutureExt;
 use itertools::Itertools;
 use rand::rngs::{SmallRng, ThreadRng};
@@ -21,8 +20,7 @@ use crate::thread_utils::run_future_in_new_thread;
 use crate::{common::*, DeviceInfo};
 use crate::{media_clock::{ClockOverlay, MediaClock}, net_utils::MTU, protocol::flows_control::FlowHandle, Sample};
 use crate::samples_utils::*;
-use cirb::Output as RBOutput;
-use cirb::Input as RBInput;
+use crate::ring_buffer::{ProxyToSamplesBuffer, RBInput, RBOutput};
 
 pub const FPP_MIN: u16 = 2;
 pub const FPP_MAX: u16 = 256;
@@ -71,17 +69,17 @@ enum Command {
   UpdateClockOverlay(ClockOverlay),
 }
 
-struct FlowsTransmitterInternal {
+struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   commands_receiver: mpsc::Receiver<Command>,
   sample_rate: u32,
   flows: Vec<Option<Flow>>,
   clock: MediaClock,
-  channels_sources: Vec<RBOutput<Sample>>,
+  channels_sources: Vec<RBOutput<Sample, P>>,
   send_latency_samples: usize,
   //callback: SamplesRequestCallback,
 }
 
-impl FlowsTransmitterInternal {
+impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
   fn now(&self) -> Option<Clock> {
     self.clock.now_in_timebase(self.sample_rate as u64)
   }
@@ -121,6 +119,7 @@ impl FlowsTransmitterInternal {
           for (index_in_flow, &ch_opt) in flow.channel_indices.iter().enumerate() {
             if let Some(ch_index) = ch_opt {
               //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
+              // TODO remove not really necessary copy to tmp_samples, write_*_samples could read directly from ring buffer
               let r = self.channels_sources[ch_index].read_at(start_ts, &mut tmp_samples[0..flow.fpp]);
               if r.useful_start_index != 0 || r.useful_end_index != flow.fpp {
                 error!("didn't have enough samples, transmitting silence. {} {}", r.useful_start_index, flow.fpp-r.useful_end_index);
@@ -271,7 +270,7 @@ fn split_handle(h: FlowHandle) -> (u32, u16) {
 }
 
 impl FlowsTransmitter {
-  async fn run(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample>>) {
+  async fn run<P: ProxyToSamplesBuffer>(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample, P>>) {
     let mut internal = FlowsTransmitterInternal {
       commands_receiver: rx,
       sample_rate,
@@ -290,7 +289,7 @@ impl FlowsTransmitter {
     };
     internal.run().await;
   }
-  pub fn start(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>) -> (Self, Vec<RBInput<Sample>>, JoinHandle<()>) {
+  pub fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static>(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>, channels_outputs: Vec<RBOutput<Sample, P>>) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
     tokio::spawn(async move {
@@ -310,9 +309,6 @@ impl FlowsTransmitter {
       }
     });
     let srate = self_info.sample_rate;
-    let (channels_inputs, channels_outputs) = (0..self_info.tx_channels.len()).map(|_| {
-      cirb::RTHistory::<Sample>::new(BUFFERED_SAMPLES_PER_CHANNEL, 0).split()
-    }).unzip();
     // TODO dehardcode latency_ns
     let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 30_000_000, channels_outputs).boxed_local());
     return (Self {
@@ -321,7 +317,7 @@ impl FlowsTransmitter {
       flow_seq_id: 0.into(),
       flows: BTreeMap::new(),
       ip_port_to_id: BTreeMap::new()
-    }, channels_inputs, thread_join);
+    }, thread_join);
   }
   pub async fn shutdown(&self) {
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();

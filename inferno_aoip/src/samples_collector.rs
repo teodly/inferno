@@ -1,7 +1,6 @@
 use std::{pin::Pin, sync::Arc, time::Duration};
 
-use crate::{common::*, device_info::DeviceInfo, media_clock::{async_clock_receiver_to_realtime, ClockOverlay, MediaClock}, real_time_box_channel::{self, RealTimeBoxReceiver, RealTimeBoxSender}};
-use cirb::{wrapped_diff, Clock, Output as RBOutput};
+use crate::{common::*, device_info::DeviceInfo, media_clock::{async_clock_receiver_to_realtime, ClockOverlay, MediaClock}, real_time_box_channel::{self, RealTimeBoxReceiver, RealTimeBoxSender}, ring_buffer::{wrap_external_source, ExternalBufferParameters, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput}};
 use futures::{Future, FutureExt};
 
 use itertools::Itertools;
@@ -15,15 +14,15 @@ const MAX_LAG_SAMPLES: usize = 9600;
 pub type SamplesCallback = Box<dyn FnMut(usize, &Vec<Vec<Sample>>) + Send + 'static>;
 
 
-struct Channel {
+struct Channel<P: ProxyToSamplesBuffer> {
   id: usize,
-  source: RBOutput<Sample>,
+  source: RBOutput<Sample, P>,
   prev_holes_count: usize,
   latency_samples: Clock,
   was_connected: bool,
 }
 
-impl Channel {
+impl<P: ProxyToSamplesBuffer> Channel<P> {
   fn report_lost_samples(&self, timestamp: Clock, num_samples: usize, reason: &str) {
     error!("Lost {num_samples} samples at timestamp {timestamp} in channel id {} ({reason})", self.id);
   }
@@ -63,19 +62,21 @@ impl Channel {
       }
     }
     if !good {
-      warn!("wanted {start_timestamp}..{} but has ..{}", start_timestamp + buffer.len(), self.source.readable_until().unwrap_or(0));
+      warn!("wanted {start_timestamp}..{} but has ..{}", start_timestamp + buffer.len(), self.source.readable_until());
     }
     good
   }
 }
 
-pub struct RealTimeSamplesReceiver {
-  channels: Vec<RealTimeBoxReceiver<Option<Channel>>>,
+pub struct RealTimeSamplesReceiver<P: ProxyToSamplesBuffer> {
+  channels: Vec<RealTimeBoxReceiver<Option<Channel<P>>>>,
   clock: MediaClock,
   clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>,
 }
 
-impl RealTimeSamplesReceiver {
+// MAYBE TODO move timestamp checks to separate module
+
+impl<P: ProxyToSamplesBuffer> RealTimeSamplesReceiver<P> {
   fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
     get_min_max_end_timestamps(self.channels.iter().map(|chrecv|chrecv.get()))
   }
@@ -111,19 +112,19 @@ impl RealTimeSamplesReceiver {
 }
 
 
-enum Command {
+enum Command<P: ProxyToSamplesBuffer> {
   NoOp,
   Shutdown,
-  ConnectChannel { channel_index: usize, source: RBOutput<Sample>, latency_samples: usize },
+  ConnectChannel { channel_index: usize, source: RBOutput<Sample, P>, latency_samples: usize },
   DisconnectChannel { channel_index: usize },
 }
 
-struct ToRealTime {
-  commands_receiver: mpsc::Receiver<Command>,
-  senders: Vec<RealTimeBoxSender<Option<Channel>>>,
+struct ToRealTime<P: ProxyToSamplesBuffer> {
+  commands_receiver: mpsc::Receiver<Command<P>>,
+  senders: Vec<RealTimeBoxSender<Option<Channel<P>>>>,
 }
 
-impl ToRealTime {
+impl<P: ProxyToSamplesBuffer> ToRealTime<P> {
   async fn run(&mut self) {
     loop {
       let command_opt = self.commands_receiver.recv().await;
@@ -135,7 +136,7 @@ impl ToRealTime {
       }
     }
   }
-  async fn handle_command(&mut self, command_opt: Option<Command>) -> bool {
+  async fn handle_command(&mut self, command_opt: Option<Command<P>>) -> bool {
     let command = command_opt.unwrap_or(Command::Shutdown);
     match command {
       Command::ConnectChannel{channel_index, source, latency_samples } => {
@@ -163,18 +164,17 @@ impl ToRealTime {
 
 
 
-struct PeriodicSamplesCollector {
-  commands_receiver: mpsc::Receiver<Command>,
-  channels: Vec<Option<Channel>>,
+struct PeriodicSamplesCollector<P: ProxyToSamplesBuffer> {
+  commands_receiver: mpsc::Receiver<Command<P>>,
+  channels: Vec<Option<Channel<P>>>,
   callback: SamplesCallback,
 }
 
-fn get_min_max_end_timestamps<'a>(channels: impl IntoIterator<Item = &'a Option<Channel>>) -> Option<(Clock, Clock)> {
+fn get_min_max_end_timestamps<'a, P: ProxyToSamplesBuffer + 'a>(channels: impl IntoIterator<Item = &'a Option<Channel<P>>>) -> Option<(Clock, Clock)> {
   let clocks = channels
     .into_iter()
     .filter_map(|opt| opt.as_ref())
     .map(|ch| ch.source.readable_until())
-    .filter_map(|opt| opt)
     .collect_vec();
   Some((
     clocks.iter().min_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?.to_owned(),
@@ -182,7 +182,7 @@ fn get_min_max_end_timestamps<'a>(channels: impl IntoIterator<Item = &'a Option<
   ))
 }
 
-impl PeriodicSamplesCollector {
+impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
   fn get_min_max_end_timestamps(&self) -> Option<(Clock, Clock)> {
     get_min_max_end_timestamps(&self.channels)
   }
@@ -230,13 +230,10 @@ impl PeriodicSamplesCollector {
                       // or lag prevention logic triggers,
                       // it would break our assumption that each channel has *at least* readable_samples_count readable.
                       // that's why we need this check.
-                      match ch.source.readable_until() {
-                        Some(ts) => if wrapped_diff(ts, readable_until) < 0 {
-                          None
-                        } else {
-                          Some(ch)
-                        }
-                        None => None
+                      if wrapped_diff(ch.source.readable_until(), readable_until) < 0 {
+                        None
+                      } else {
+                        Some(ch)
                       }
                     } else {
                       None
@@ -255,6 +252,11 @@ impl PeriodicSamplesCollector {
                 readable_until
               }
             };
+            for chi in 0..self.channels.len() {
+              if let Some(ch) = &mut self.channels[chi] {
+                ch.source.read_done(new_clock);
+              }
+            }
             clock = Some(new_clock);
           }
         }
@@ -266,7 +268,7 @@ impl PeriodicSamplesCollector {
       }
     }
   }
-  async fn handle_command(&mut self, command_opt: Option<Command>) -> bool {
+  async fn handle_command(&mut self, command_opt: Option<Command<P>>) -> bool {
     let command = command_opt.unwrap_or(Command::Shutdown);
     match command {
       Command::ConnectChannel{channel_index, source, latency_samples } => {
@@ -287,12 +289,11 @@ impl PeriodicSamplesCollector {
 }
 
 
-pub struct SamplesCollector {
-  commands_sender: mpsc::Sender<Command>,
+pub struct SamplesCollector<P: ProxyToSamplesBuffer> {
+  commands_sender: mpsc::Sender<Command<P>>,
 }
 
-impl SamplesCollector {
-
+impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
   pub fn new_with_callback(
     self_info: Arc<DeviceInfo>,
     callback: SamplesCallback,
@@ -306,7 +307,7 @@ impl SamplesCollector {
     return (Self { commands_sender: tx }, async move { internal.run().await }.boxed());
   }
 
-  pub fn new_realtime(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>, RealTimeSamplesReceiver) {
+  pub fn new_realtime(self_info: Arc<DeviceInfo>, media_clock_receiver: broadcast::Receiver<ClockOverlay>) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>, RealTimeSamplesReceiver<P>) {
     let (tx, rx) = mpsc::channel(100);
     let (senders, receivers) = (0..self_info.rx_channels.len()).map(|chi| {
       real_time_box_channel::channel(Box::new(None))
@@ -324,7 +325,11 @@ impl SamplesCollector {
     })
   }
 
-  pub async fn connect_channel(&self, channel_index: usize, source: RBOutput<Sample>, latency_samples: usize) {
+  /* pub fn new_external(self_info: Arc<DeviceInfo>, external_channels: impl IntoIterator<Item = ExternalBufferParameters<Sample>>) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
+    
+  } */
+
+  pub async fn connect_channel(&self, channel_index: usize, source: RBOutput<Sample, P>, latency_samples: usize) {
     self
       .commands_sender
       .send(Command::ConnectChannel { channel_index, source, latency_samples })

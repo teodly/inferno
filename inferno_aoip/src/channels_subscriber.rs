@@ -1,6 +1,7 @@
 use crate::net_utils::create_mio_udp_socket;
 use crate::samples_collector::SamplesCollector;
 use crate::state_storage::StateStorage;
+use crate::MediaClock;
 use crate::{
   common::*, mdns_client::AdvertisedChannel,
   protocol::flows_control::FlowHandle,
@@ -12,8 +13,9 @@ use crate::{
   protocol::flows_control::FlowsControlClient,
 };
 
-use cirb::Output as RBOutput;
+use crate::ring_buffer::{self, ExternalBuffer, ExternalBufferParameters, OwnedBuffer, ProxyToSamplesBuffer, RBInput, RBOutput};
 
+use atomic::Atomic;
 use futures::{future::join_all, Future, FutureExt};
 use itertools::Itertools;
 use std::collections::btree_map::Entry;
@@ -74,12 +76,13 @@ struct SavedChannelsState {
 }
 
 impl ChannelsSubscriber {
-  pub fn new(
+  pub fn new<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(
     self_info: Arc<DeviceInfo>,
-    flows_recv: Arc<FlowsReceiver>,
+    media_clock: Arc<RwLock<MediaClock>>,
+    flows_recv: Arc<FlowsReceiver<P>>,
     mdns_client: Arc<MdnsClient>,
     mcast: mpsc::Sender<MulticastMessage>,
-    samples_collector: Arc<SamplesCollector>,
+    channels_buffering: B,
     state_storage: Arc<StateStorage>,
     ref_instant: Instant,
   ) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
@@ -88,14 +91,15 @@ impl ChannelsSubscriber {
       commands_sender: tx,
       subscriptions_info: Arc::new(RwLock::new(vec![None; self_info.rx_channels.len()])),
     };
-    let mut internal = ChannelsSubscriberInternal::new(
+    let mut internal = ChannelsSubscriberInternal::<P, B>::new(
       rx,
       self_info,
+      media_clock,
       flows_recv,
       mdns_client,
       r.subscriptions_info.clone(),
       mcast,
-      samples_collector,
+      channels_buffering,
       state_storage,
       ref_instant,
     );
@@ -134,17 +138,90 @@ impl ChannelsSubscriber {
   }
 }
 
-struct SamplesQueue {
-  source: RBOutput<Sample>,
+
+
+pub trait ChannelsBuffering<P: ProxyToSamplesBuffer> {
+  fn get_io(&self, start_time: Clock, channel_index: usize) -> (RBInput<Sample, P>, Option<RBOutput<Sample, P>>);
+  //fn samples_collector(&self) -> Option<Arc<SamplesCollector<P>>>;
+  fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, P>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, P>>;
+  fn disconnect_channel(&self, channel_index: usize);
 }
 
-struct Flow {
+pub struct OwnedBuffering {
+  buffer_length: usize,
+  hole_fix_wait: usize,
+  samples_collector: Arc<SamplesCollector<OwnedBuffer<Atomic<Sample>>>>,
+}
+
+impl OwnedBuffering {
+  pub fn new(buffer_length: usize, hole_fix_wait: usize, samples_collector: Arc<SamplesCollector<OwnedBuffer<Atomic<Sample>>>>) -> Self {
+    Self { buffer_length, hole_fix_wait, samples_collector }
+  }
+}
+
+impl ChannelsBuffering<OwnedBuffer<Atomic<Sample>>> for OwnedBuffering {
+  fn get_io(&self, start_time: Clock, _channel_index: usize) -> (RBInput<Sample, OwnedBuffer<Atomic<Sample>>>, Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>) {
+    let (input, output) = ring_buffer::new_owned::<Sample>(self.buffer_length, start_time, self.hole_fix_wait);
+    (input, Some(output))
+  }
+  /* fn samples_collector(&self) -> Option<Arc<SamplesCollector<OwnedBuffer<Atomic<Sample>>>>> {
+    Some(self.samples_collector.clone())
+  } */
+  fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, OwnedBuffer<Atomic<Sample>>>> {
+    let (sink, source) = if rb_output.is_none() {
+      let (sink, source) =
+        ring_buffer::new_owned::<Sample>(self.buffer_length, start_time, self.hole_fix_wait);
+      *rb_output = Some(source.clone());
+      (Some(sink), source)
+    } else {
+      (None, rb_output.as_ref().unwrap().clone())
+    };
+    let sc = self.samples_collector.clone();
+    tokio::spawn(async move {
+      sc.connect_channel(channel_index, source, latency_samples).await;
+    });
+    sink
+  }
+  fn disconnect_channel(&self, channel_index: usize) {
+    let sc = self.samples_collector.clone();
+    tokio::spawn(async move {
+      sc.disconnect_channel(channel_index).await;
+    });
+  }
+}
+
+pub struct ExternalBuffering {
+  channels: Vec<ExternalBufferParameters<Sample>>,
+  hole_fix_wait: usize,
+}
+
+impl ExternalBuffering {
+  pub fn new(channels: Vec<ExternalBufferParameters<Sample>>, hole_fix_wait: usize) -> Self {
+    Self {
+      channels,
+      hole_fix_wait
+    }
+  }
+}
+
+impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
+  fn get_io(&self, start_time: Clock, channel_index: usize) -> (RBInput<Sample, ExternalBuffer<Atomic<Sample>>>, Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>) {
+    (ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time, self.hole_fix_wait), None)
+  }
+  fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, ExternalBuffer<Atomic<Sample>>>> {
+    debug_assert!(rb_output.is_none());
+    Some(ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time, self.hole_fix_wait))
+  }
+  fn disconnect_channel(&self, _channel_index: usize) {
+  }
+}
+
+struct Flow<P: ProxyToSamplesBuffer> {
   local_id: usize,
   control_remote_addr: SocketAddr, // TODO change to enum that will include multicasts
   handle: Option<FlowHandle>,
-  //channels_occupied: Vec<bool>,
   channels_refcount: Vec<isize>,
-  channels_queues: Vec<Option<SamplesQueue>>,
+  channels_rb_outputs: Vec<Option<RBOutput<Sample, P>>>,
   tx_channels: Vec<Option<u16>>,
   dbcp1: u16,
   latency_samples: usize,
@@ -153,7 +230,7 @@ struct Flow {
   creation_time: usize,
 }
 
-impl Flow {
+impl<P: ProxyToSamplesBuffer> Flow<P> {
   fn new(
     local_id: usize,
     control_remote_addr: SocketAddr,
@@ -162,16 +239,16 @@ impl Flow {
     dbcp1: u16,
     latency_samples: usize,
     now: usize,
-  ) -> Flow {
+  ) -> Self {
     let chs = vec![0; total_channels];
     let mut tx_channels = tx_channels.into_iter().map(|ch| Some(ch)).collect_vec();
     tx_channels.resize(total_channels, None);
-    Flow {
+    Self {
       local_id,
       control_remote_addr,
       handle: None,
       channels_refcount: chs,
-      channels_queues: (0..total_channels).map(|_| None).collect(),
+      channels_rb_outputs: (0..total_channels).map(|_| None).collect(),
       tx_channels,
       dbcp1,
       latency_samples,
@@ -199,34 +276,37 @@ struct ChannelSubscription {
   remote: Option<ChannelOtherEnd>,
 }
 
-struct ChannelsSubscriberInternal {
+struct ChannelsSubscriberInternal<P: ProxyToSamplesBuffer, B: ChannelsBuffering<P>> {
   commands_receiver: mpsc::Receiver<Command>,
   self_info: Arc<DeviceInfo>,
+  media_clock: Arc<RwLock<MediaClock>>,
   channels: Vec<Option<ChannelSubscription>>,
-  flows: Arc<Mutex<Vec<Option<Flow>>>>,
-  flows_recv: Arc<FlowsReceiver>,
-  buffered_samples_per_channel: usize,
+  flows: Arc<Mutex<Vec<Option<Flow<P>>>>>,
+  flows_recv: Arc<FlowsReceiver<P>>,
+  //buffered_samples_per_channel: usize,
   min_latency_ns: usize,
   control_client: Arc<FlowsControlClient>,
   mdns_client: Arc<MdnsClient>,
   subscriptions_info: Arc<RwLock<Vec<Option<SubscriptionInfo>>>>,
   mcast: mpsc::Sender<MulticastMessage>,
-  samples_collector: Arc<SamplesCollector>,
+  channels_buffering: B,
+  //samples_collector: Arc<SamplesCollector<P>>,
   state_storage: Arc<StateStorage>,
   ref_instant: Instant,
   needs_resolving: bool,
   resolve_now: bool,
 }
 
-impl ChannelsSubscriberInternal {
+impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> ChannelsSubscriberInternal<P, B> {
   pub fn new(
     commands_receiver: mpsc::Receiver<Command>,
     self_info: Arc<DeviceInfo>,
-    flows_recv: Arc<FlowsReceiver>,
+    media_clock: Arc<RwLock<MediaClock>>,
+    flows_recv: Arc<FlowsReceiver<P>>,
     mdns_client: Arc<MdnsClient>,
     subscriptions_info: Arc<RwLock<Vec<Option<SubscriptionInfo>>>>,
     mcast: mpsc::Sender<MulticastMessage>,
-    samples_collector: Arc<SamplesCollector>,
+    channels_buffering: B,
     state_storage: Arc<StateStorage>,
     ref_instant: Instant,
   ) -> Self {
@@ -234,16 +314,17 @@ impl ChannelsSubscriberInternal {
     return Self {
       commands_receiver,
       self_info: self_info.clone(),
+      media_clock,
       channels: vec![None; num_channels],
       flows: Arc::new(Mutex::new(vec![])),
       flows_recv,
-      buffered_samples_per_channel: 524288,
+      //buffered_samples_per_channel: 524288,
       min_latency_ns: 30_000_000, // TODO dehardcode
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
       subscriptions_info,
       mcast,
-      samples_collector,
+      channels_buffering,
       state_storage,
       ref_instant,
       needs_resolving: false,
@@ -271,7 +352,7 @@ impl ChannelsSubscriberInternal {
       .log_and_forget();
   }
   pub async fn unsubscribe(&mut self, local_channel_index: usize, remove_from_info: bool) {
-    self.samples_collector.disconnect_channel(local_channel_index).await;
+    self.channels_buffering.disconnect_channel(local_channel_index);
     if let Some(subscription) = &self.channels[local_channel_index] {
       if let Some(remote) = subscription.remote.as_ref() {
         match &mut self.flows.lock().unwrap()[remote.local_flow_index] {
@@ -697,6 +778,14 @@ impl ChannelsSubscriberInternal {
     while let Some(updates) = rx.recv().await {
       trace!("recv something");
       let mut changed_channels = vec![];
+      let now = self.media_clock.read().unwrap().now_in_timebase(self.self_info.sample_rate as u64);
+      let now = match now {
+        Some(v) => v,
+        None => {
+          error!("can't subscribe, clock not ready");
+          continue;
+        }
+      };
       for upd in updates {
         let first_index = upd.local_channel_indices[0];
         info!(
@@ -713,24 +802,18 @@ impl ChannelsSubscriberInternal {
           let flow = flows[remote.local_flow_index].as_mut().unwrap();
           flow.tx_channels[remote.channel_in_flow] = Some(remote.tx_channel_id);
           flow.channels_refcount[remote.channel_in_flow] += 1;
-          if flow.channels_queues[remote.channel_in_flow].is_none() {
-            let (sink, source) =
-              cirb::RTHistory::<Sample>::new(self.buffered_samples_per_channel, REORDER_WAIT_SAMPLES).split();
-            let flows_recv = self.flows_recv.clone();
+          if flow.channels_rb_outputs[remote.channel_in_flow].is_none() {
+            // ringbuffer doesn't exist yet (this channel in flow wasn't used before)
             let local_id = flow.local_id;
             debug_assert!(local_id == remote.local_flow_index+1);
+          }
+          let sink_opt = self.channels_buffering.connect_channel(now, &mut flow.channels_rb_outputs[remote.channel_in_flow], chi, flow.latency_samples);
+          if let Some(sink) = sink_opt {
+            let flows_recv = self.flows_recv.clone();
             tokio::spawn(async move {
               flows_recv.connect_channel(remote.local_flow_index, remote.channel_in_flow, sink).await;
             });
-            flow.channels_queues[remote.channel_in_flow] = Some(SamplesQueue { source })
           }
-          let samples_source =
-            flow.channels_queues[remote.channel_in_flow].as_ref().unwrap().source.clone();
-          let latency_samples = flow.latency_samples;
-          let samples_collector = self.samples_collector.clone();
-          tokio::spawn(async move {
-            samples_collector.connect_channel(chi, samples_source, latency_samples).await;
-          });
           subscription.remote = Some(remote);
           subinfos[chi] = Some(SubscriptionInfo {
             tx_channel_name: subscription.tx_channel_name.clone(),
@@ -748,6 +831,10 @@ impl ChannelsSubscriberInternal {
     trace!("recv loop exited");
     return true;
   }
+
+  /* fn get_ring_buffer(&self, local_channel_index: usize) -> (RBInput<Sample, P>, Option<RBOutput<Sample, P>>) {
+
+  } */
 
   async fn scan_flows(&mut self) -> bool {
     let mut destroy_futures_per_remote: BTreeMap<
@@ -797,10 +884,7 @@ impl ChannelsSubscriberInternal {
                             subi.status = SubscriptionStatus::Unresolved;
                             channels_changed.push(chi);
                           }
-                          let samples_collector = self.samples_collector.clone();
-                          tokio::spawn(async move {
-                            samples_collector.disconnect_channel(chi).await;
-                          });
+                          self.channels_buffering.disconnect_channel(chi);
                         } else if receiving {
                           if let Some(subi) = self.subscriptions_info.write().unwrap()[chi].as_mut()
                           {

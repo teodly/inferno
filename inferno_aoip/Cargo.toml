@@ -20,7 +20,6 @@ itertools = "0.12"
 log = "0.4"
 atomic_enum = "0.2"
 local-ip-address = "0.5"
-cirb = { path = "../cirb" }
 atomic = "0.6"
 rand = { version="0.8", features=["small_rng"] }
 toml = "0.8"
@@ -31,7 +30,10 @@ interprocess = { version = "1.2", features = ["tokio_support"] }
 thiserror = "1.0.57"
 thread-priority = "0.15"
 atomicbox = "0.4.0"
-mio = { version = "0.8.10", features = ["net", "os-ext", "os-poll"] }
+mio = { version = "1.0.2", features = ["net", "os-ext", "os-poll"] }
+bool_vec = "0.2.1"
+bytemuck = "1.17.1"
+usrvclock = { git = "https://gitlab.com/lumifaza/usrvclock-rs", version = "0.1.0" }
 
 [dependencies.serde]
 version = "1.0.159"

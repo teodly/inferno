@@ -1,5 +1,5 @@
-/// Used for decoupling memory allocation and deallocation from realtime thread.
-/// Sender is non-real-time, receiver is real-time.
+//! Used for decoupling memory allocation and deallocation from realtime thread.
+//! Sender is non-real-time, receiver is real-time.
 
 use std::{mem, sync::Arc};
 

@@ -1,55 +1,28 @@
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use clock_steering::unix::UnixClock;
 use clock_steering::Clock as _;
 use custom_error::custom_error;
-use cirb::{Clock, ClockDiff};
 use futures::AsyncWriteExt;
 use interprocess::local_socket::tokio::LocalSocketStream;
 use tokio::select;
 use tokio::sync::broadcast;
 use futures::io::AsyncReadExt;
+pub use usrvclock::ClockOverlay;
+pub use usrvclock::AsyncClient as ClockReceiver;
 
 use crate::{common::*, real_time_box_channel};
 use crate::real_time_box_channel::RealTimeBoxReceiver;
+pub type RealTimeClockReceiver = RealTimeBoxReceiver<Option<ClockOverlay>>;
 
 // it's better to have the clock in the past than in the future - otherwise Dante devices receiving from us go mad and fart
 const CLOCK_OFFSET_NS: ClockDiff = -500_000;
 
-#[derive(Clone, Copy, Debug)]
-pub struct ClockOverlay {
-  last_sync: Clock,
-  shift: ClockDiff,
-  freq_scale: f64,
-}
-
-custom_error! { pub ClockDecodeError
-  BufferTooShort = "buffer too short",
-  InvalidMagicNumber = "invalid magic number"
-}
-
-impl ClockOverlay {
-  fn from_packet_buffer(buffer: &[u8]) -> Result<Self, ClockDecodeError> {
-    let buf: [u8; 32] = buffer.try_into().map_err(|_|ClockDecodeError::BufferTooShort)?;
-    if buf[0..8] != *b"TAIovl\x00\x01" {
-      return Err(ClockDecodeError::InvalidMagicNumber);
-    }
-    Ok(Self {
-      last_sync: Clock::from_ne_bytes(buf[8..16].try_into().unwrap()),
-      shift: ClockDiff::from_ne_bytes(buf[16..24].try_into().unwrap()),
-      freq_scale: f64::from_ne_bytes(buf[24..32].try_into().unwrap())
-    })
-  }
-  fn timestamp_from_underlying(&self, ts: Clock) -> Clock {
-    let elapsed = (ts as ClockDiff).wrapping_sub(self.last_sync as ClockDiff);
-    let corr = (elapsed as f64 * self.freq_scale) as ClockDiff;
-    (ts as ClockDiff).wrapping_add(self.shift).wrapping_add(corr) as Clock
-  }
-}
 
 #[derive(Clone)]
 pub struct MediaClock {
-  clock: UnixClock,
   overlay: Option<ClockOverlay>,
 }
 
@@ -61,22 +34,17 @@ fn timestamp_to_clock_value(ts: clock_steering::Timestamp) -> Clock {
 impl MediaClock {
   pub fn new() -> Self {
     Self {
-      clock: UnixClock::CLOCK_TAI,
       overlay: None
     }
   }
   pub fn is_ready(&self) -> bool {
     self.overlay.is_some()
   }
-  fn now_underlying(&self) -> Clock {
-    timestamp_to_clock_value(self.clock.now().unwrap())
-  }
   pub fn update_overlay(&mut self, mut overlay: ClockOverlay) {
-    overlay.shift = overlay.shift.wrapping_add(CLOCK_OFFSET_NS);
+    overlay.shift = overlay.shift.wrapping_add(CLOCK_OFFSET_NS as i64);
     if let Some(cur_overlay) = self.overlay {
-      let ro_now = self.now_underlying();
-      let cur_ovl_time = cur_overlay.timestamp_from_underlying(ro_now);
-      let new_ovl_time = overlay.timestamp_from_underlying(ro_now);
+      let cur_ovl_time = cur_overlay.now_ns();
+      let new_ovl_time = overlay.now_ns();
       let diff = (new_ovl_time as ClockDiff).wrapping_sub(cur_ovl_time as ClockDiff);
       if diff.abs() > 200_000_000 {
         error!("clock is trying to jump dangerously by {diff} ns, ignoring update");
@@ -87,13 +55,12 @@ impl MediaClock {
   }
   #[inline(always)]
   pub fn now_ns(&self) -> Option<Clock> {
-    self.overlay.map(|overlay| {
-      overlay.timestamp_from_underlying(self.now_underlying())
-    })
+    self.overlay.map(|overlay| { overlay.now_ns() as Clock })
   }
   #[inline(always)]
   pub fn now_in_timebase(&self, timebase_hz: u64) -> Option<Clock> {
     self.now_ns().map(|ns| {
+      // TODO it will jump when underlying wraps
       ((ns as u128) * (timebase_hz as u128) / 1_000_000_000u128) as Clock
     })
   }
@@ -112,58 +79,30 @@ impl MediaClock {
 }
 
 
-pub async fn start_clock_receiver(tx: broadcast::Sender<ClockOverlay>, mut shutdown: broadcast::Receiver<()>) {
+pub fn start_clock_receiver() -> ClockReceiver {
+  ClockReceiver::start(usrvclock::DEFAULT_SERVER_SOCKET_PATH.into(), Box::new(|e| warn!("clock receive error: {e:?}")))
+}
+
+pub fn make_shared_media_clock(receiver: &ClockReceiver) -> Arc<RwLock<MediaClock>> {
+  let mut rx = receiver.subscribe();
+  let media_clock = Arc::new(RwLock::new(MediaClock::new()));
+  let media_clock1 = media_clock.clone();
   tokio::spawn(async move {
-    let mut buff = [0u8; 32];
-    async fn read_from_stream(stream_opt: &mut Option<LocalSocketStream>, buff: &mut [u8]) {
-      loop {
-        let stream = loop {
-          if stream_opt.is_none() {
-            let result = LocalSocketStream::connect("/tmp/ptp-clock-overlay").await;
-            match result {
-              Ok(stream) => {
-                *stream_opt = Some(stream);
-              },
-              Err(e) => {
-                warn!("could not open clock: {e:?}");
-                tokio::time::sleep(Duration::from_secs(1)).await;
-              }
-            }
-          }
-          if let Some(stream) = stream_opt {
-            break stream;
-          }
-        };
-        match stream.read_exact(buff).await {
-          Ok(_) => { break; },
-          Err(e) => {
-            warn!("could not read clock: {e:?}, will reopen stream");
-            *stream_opt = None;
-          }
-        }
-      }
-    }
-    let mut stream_opt = None;
     loop {
-      select! {
-        _ = read_from_stream(&mut stream_opt, &mut buff) => {
-          match ClockOverlay::from_packet_buffer(&buff) {
-            Ok(overlay) => {
-              tx.send(overlay);
-            },
-            Err(e) => {
-              warn!("failed to receive clock from PTP daemon: {e:?}");
-            }
-          }
-        },
-        _ = shutdown.recv() => {
+      match rx.recv().await {
+        Ok(overlay) => {
+          media_clock.write().unwrap().update_overlay(overlay);
+        }
+        Err(broadcast::error::RecvError::Closed) => {
           break;
+        },
+        Err(e) => {
+          warn!("clock receive error {e:?}");
         }
       }
-      //break; // was testing whether the clock is to blame for tx buffer underruns
     }
-    warn!("clock receiver exiting");
   });
+  media_clock1
 }
 
 pub fn async_clock_receiver_to_realtime(mut receiver: broadcast::Receiver<ClockOverlay>) -> RealTimeBoxReceiver<Option<ClockOverlay>> {

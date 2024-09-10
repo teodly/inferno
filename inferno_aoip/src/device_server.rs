@@ -1,13 +1,16 @@
-use crate::channels_subscriber::ChannelsSubscriber;
+use crate::channels_subscriber::{ChannelsBuffering, ChannelsSubscriber, ExternalBuffering, OwnedBuffering};
 use crate::flows_tx::FlowsTransmitter;
-use crate::media_clock::{async_clock_receiver_to_realtime, start_clock_receiver, ClockOverlay};
+use crate::media_clock::{async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver};
 use crate::real_time_box_channel::RealTimeBoxReceiver;
 use crate::samples_collector::{RealTimeSamplesReceiver, SamplesCallback, SamplesCollector};
 use crate::state_storage::StateStorage;
+use crate::ring_buffer::{ExternalBuffer, ExternalBufferParameters, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBInput};
+use atomic::Atomic;
 use futures::{Future, FutureExt};
 use itertools::Itertools;
 use tokio::sync::broadcast::Receiver;
 use tokio::task::JoinHandle;
+use usrvclock::ClockOverlay;
 
 use std::fs::File;
 use std::io::Write;
@@ -20,11 +23,10 @@ use std::sync::{Arc, Mutex};
 use std::net::IpAddr;
 use std::time::Instant;
 use tokio::sync::{broadcast as broadcast_queue, mpsc};
-use cirb::Input as RBInput;
 
 use crate::device_info::{Channel, DeviceInfo};
 
-use crate::common::*;
+use crate::{common::*, RealTimeClockReceiver};
 
 pub trait SelfInfoBuilder {
   fn new_self(app_name: &str, short_app_name: &str, my_ip: Option<Ipv4Addr>) -> DeviceInfo;
@@ -93,27 +95,37 @@ impl SelfInfoBuilder for DeviceInfo {
 
 pub struct DeviceServer {
   pub self_info: Arc<DeviceInfo>,
-  tx_inputs: Vec<RBInput<Sample>>,
+  //tx_inputs: Vec<RBInput<Sample, P>>,
   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>
 }
 
 impl DeviceServer {
   pub async fn start_with_recv_callback(self_info: DeviceInfo, samples_callback: SamplesCallback) -> Self {
-    Self::start(self_info, |si: &Arc<DeviceInfo>, _| {
-      SamplesCollector::new_with_callback(si.clone(), Box::new(samples_callback))
+    Self::start::<OwnedBuffer<Atomic<Sample>>, OwnedBuffering>(self_info, |si: &Arc<DeviceInfo>, workers, _| {
+      let (sc, future) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(si.clone(), Box::new(samples_callback));
+      workers.push(tokio::spawn(future));
+      OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(sc))
     }).await
   }
-  pub async fn start_with_realtime_receiver(self_info: DeviceInfo) -> (Self, RealTimeSamplesReceiver, RealTimeBoxReceiver<Option<ClockOverlay>>) {
+  pub async fn start_with_realtime_receiver(self_info: DeviceInfo) -> (Self, RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>>, RealTimeBoxReceiver<Option<ClockOverlay>>) {
     let mut rt_recv = None;
     let mut clk = None;
-    (Self::start(self_info, |si: &Arc<DeviceInfo>, clkrcv: &broadcast_queue::Sender<ClockOverlay>| {
+    (Self::start(self_info, |si: &Arc<DeviceInfo>, workers, clkrcv: &ClockReceiver| {
       let (col, col_fut, rtr) = SamplesCollector::new_realtime(si.clone(), clkrcv.subscribe());
       rt_recv = Some(rtr);
       clk = Some(clkrcv.subscribe());
-      (col, col_fut)
+      workers.push(tokio::spawn(col_fut));
+      OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col))
     }).await, rt_recv.unwrap(), async_clock_receiver_to_realtime(clk.unwrap()))
   }
-  pub async fn start(self_info: DeviceInfo, create_collector: impl FnOnce(&Arc<DeviceInfo>, &broadcast_queue::Sender<ClockOverlay>) -> (SamplesCollector, Pin<Box<dyn Future<Output = ()> + Send + 'static>>)) -> Self {
+  pub async fn start_with_external_buffering(self_info: DeviceInfo, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>) -> (Self, RealTimeClockReceiver) {
+    let mut clk = None;
+    (Self::start::<ExternalBuffer<Atomic<Sample>>, ExternalBuffering>(self_info, |si: &Arc<DeviceInfo>, workers, clkrcv| {
+      clk = Some(clkrcv.subscribe());
+      ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/)
+    }).await, async_clock_receiver_to_realtime(clk.unwrap()))
+  }
+  pub async fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(self_info: DeviceInfo, create_rx_buffering: impl FnOnce(&Arc<DeviceInfo>, &mut Vec<JoinHandle<()>>, &ClockReceiver) -> B) -> Self {
     let self_info = Arc::new(self_info);
     let state_storage = Arc::new(StateStorage::new(&self_info));
     let ref_instant = Instant::now();
@@ -124,32 +136,35 @@ impl DeviceServer {
     let shdn_recv4 = shutdown_send.subscribe();
     let mdns_handle = crate::mdns_server::start_server(self_info.clone());
 
-    let (clock_tx, clock_rx) = broadcast_queue::channel(100);
-    
     let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self_info.clone(), ref_instant);
     let flows_rx_handle = Arc::new(flows_rx_handle);
 
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.ip_address));
     let (mcast_tx, mcast_rx) = mpsc::channel(100);
 
-    let (samples_collector, samples_collector_worker) = create_collector(&self_info, &clock_tx);
-    let samples_collector = Arc::new(samples_collector);
+    let clock_receiver = start_clock_receiver();
+
+    info!("waiting for clock");
+    clock_receiver.subscribe().recv().await.unwrap();
+    info!("clock ready");
+
+    let mut tasks = vec![];
+    let channels_buffering = create_rx_buffering(&self_info, &mut tasks, &clock_receiver);
     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
       self_info.clone(),
+      make_shared_media_clock(&clock_receiver),
       flows_rx_handle.clone(),
       mdns_client,
       mcast_tx,
-      samples_collector.clone(),
+      channels_buffering,
       state_storage,
       ref_instant,
     );
     let channels_sub_handle = Arc::new(channels_sub_handle);
 
-    let (flows_tx_handle, tx_inputs, flows_tx_thread) = FlowsTransmitter::start(self_info.clone(), clock_rx);
+    //let (flows_tx_handle, tx_inputs, flows_tx_thread) = FlowsTransmitter::start(self_info.clone(), clock_rx);
 
-    start_clock_receiver(clock_tx, shutdown_send.subscribe()).await;
-
-    let tasks = [
+    tasks.append(&mut vec![
       tokio::spawn(crate::arc_server::run_server(
         self_info.clone(),
         channels_sub_handle.clone(),
@@ -157,10 +172,9 @@ impl DeviceServer {
       )),
       tokio::spawn(crate::cmc_server::run_server(self_info.clone(), shdn_recv2)),
       tokio::spawn(crate::info_mcast_server::run_server(self_info.clone(), mcast_rx, shdn_recv3)),
-      tokio::spawn(crate::flows_control_server::run_server(self_info.clone(), flows_tx_handle, shdn_recv4)),
+      //tokio::spawn(crate::flows_control_server::run_server(self_info.clone(), flows_tx_handle, shdn_recv4)),
       tokio::spawn(channels_sub_worker),
-      tokio::spawn(samples_collector_worker),
-    ];
+    ]);
 
     info!("all tasks spawned");
 
@@ -169,27 +183,28 @@ impl DeviceServer {
       info!("shutting down");
       shutdown_send.send(()).unwrap();
       mdns_handle.shutdown().unwrap();
+      clock_receiver.stop().await.unwrap();
       flows_rx_handle.shutdown().await;
-      samples_collector.shutdown().await;
       channels_sub_handle1.shutdown().await;
       for task in tasks {
         task.await.unwrap();
       }
       flows_rx_thread.join().unwrap();
-      flows_tx_thread.join().unwrap();
+      //flows_tx_thread.join().unwrap();
       info!("shutdown ok");
     }.boxed();
 
     Self {
       self_info,
-      tx_inputs,
+      //tx_inputs,
       shutdown_todo
     }
   }
 
-  pub fn take_tx_inputs(&mut self) -> Vec<RBInput<Sample>> {
-    std::mem::take(&mut self.tx_inputs)
-  }
+  /* pub fn take_tx_inputs(&mut self) -> Vec<RBInput<Sample, P>> {
+    unimplemented!()
+    //std::mem::take(&mut self.tx_inputs)
+  } */
 
   pub async fn shutdown(self) {
     self.shutdown_todo.await;

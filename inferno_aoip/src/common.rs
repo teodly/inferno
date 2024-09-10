@@ -4,6 +4,18 @@ pub use log::{debug, error, info, trace, warn};
 pub type Sample = i32;
 pub type USample = u32;
 
+/// Audio clock (number of samples since arbitrary epoch)
+pub type Clock = usize;
+
+/// Signed version of the clock. For clock deltas.
+pub type ClockDiff = isize;
+
+/// Subtract clocks and return the result as a signed number.
+/// Hint: wrapped `a > b` is equivalent to `wrapped_diff(a, b) > 0`
+pub fn wrapped_diff(a: Clock, b: Clock) -> ClockDiff {
+  (a as ClockDiff).wrapping_sub(b as ClockDiff)
+}
+
 pub trait LogAndForget {
   fn log_and_forget(&self);
 }

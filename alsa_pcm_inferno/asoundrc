@@ -1,0 +1,10 @@
+pcm.!default {
+	type inferno
+	#card 0
+}
+
+ctl.!default {
+	type inferno
+	#card 0
+}
+

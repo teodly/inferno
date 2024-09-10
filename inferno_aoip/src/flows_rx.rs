@@ -3,9 +3,11 @@ use crate::device_info::DeviceInfo;
 use crate::net_utils::MTU;
 use crate::os_utils::set_current_thread_realtime;
 use crate::samples_utils::*;
+use crate::ring_buffer::{ProxyToSamplesBuffer, RBInput};
 use crate::thread_utils::run_future_in_new_thread;
 
 use std::collections::BTreeMap;
+use std::io::ErrorKind::WouldBlock;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
@@ -14,7 +16,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use atomic::Ordering;
-use cirb::Input as RBInput;
 use futures::future::select_all;
 use futures::{Future, FutureExt};
 use itertools::Itertools;
@@ -29,90 +30,98 @@ const KEEPALIVE_CONTENT: [u8; 2] = [0x13, 0x37];
 
 //pub type PacketCallback = Box<dyn FnMut(SocketAddr, &[u8]) + Send + 'static>;
 
-struct Channel {
-  sink: RBInput<Sample>,
+struct Channel<P: ProxyToSamplesBuffer> {
+  sink: RBInput<Sample, P>,
 }
 
-struct SocketData {
+struct SocketData<P: ProxyToSamplesBuffer> {
   socket: UdpSocket,
   last_source: Option<SocketAddr>,
   last_packet_time: Arc<AtomicUsize>,
   bytes_per_sample: usize,
-  channels: Vec<Option<Channel>>,
+  channels: Vec<Option<Channel<P>>>,
 }
 
-enum Command {
+enum Command<P: ProxyToSamplesBuffer> {
   NoOp,
   Shutdown,
-  AddSocket { index: usize, socket: SocketData },
+  AddSocket { index: usize, socket: SocketData<P> },
   RemoveSocket { index: usize },
-  ConnectChannel { socket_index: usize, channel_index: usize, sink: RBInput<Sample> },
+  ConnectChannel { socket_index: usize, channel_index: usize, sink: RBInput<Sample, P> },
   DisconnectChannel { socket_index: usize, channel_index: usize },
 }
 
-struct FlowsReceiverInternal {
-  commands_receiver: mpsc::Receiver<Command>,
+struct FlowsReceiverInternal<P: ProxyToSamplesBuffer> {
+  commands_receiver: mpsc::Receiver<Command<P>>,
   poll: mio::Poll,
-  sockets: Vec<Option<SocketData>>,
+  sockets: Vec<Option<SocketData<P>>>,
   sample_rate: u32,
   ref_instant: Instant,
 }
 
-impl FlowsReceiverInternal {
-  fn receive(sd: &mut SocketData, sample_rate: u32, ref_instant: Instant) -> Command {
+impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
+  fn receive(sd: &mut SocketData<P>, sample_rate: u32, ref_instant: Instant) -> Command<P> {
     let mut buf = [0; MTU];
-    match sd.socket.recv_from(&mut buf) {
-      Ok((recv_size, src)) => {
-        if recv_size < 9 {
-          error!("received corrupted (too small) packet on flow socket");
-          return Command::NoOp;
-        }
+    loop {
+      match sd.socket.recv_from(&mut buf) {
+        Ok((recv_size, src)) => {
+          if recv_size < 9 {
+            error!("received corrupted (too small) packet on flow socket");
+            return Command::NoOp;
+          }
+          //debug!("received packet");
 
-        let num_channels = sd.channels.len();
-        sd.last_packet_time.store(ref_instant.elapsed().as_secs() as _, Ordering::Relaxed);
+          let num_channels = sd.channels.len();
+          sd.last_packet_time.store(ref_instant.elapsed().as_secs() as _, Ordering::Relaxed);
 
-        let _total_num_samples = (recv_size - 9) / sd.bytes_per_sample;
-        //let audio_bytes = &buf[9..9+total_num_samples*sd.bytes_per_sample];
-        let audio_bytes = &buf[9..recv_size];
-        let timestamp = (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize)
-          .wrapping_mul(sample_rate as usize)
-          .wrapping_add(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize);
+          let _total_num_samples = (recv_size - 9) / sd.bytes_per_sample;
+          //let audio_bytes = &buf[9..9+total_num_samples*sd.bytes_per_sample];
+          let audio_bytes = &buf[9..recv_size];
+          let timestamp = (u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize)
+            .wrapping_mul(sample_rate as usize)
+            .wrapping_add(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize) as Clock;
 
-        // TODO: add timestamp sanity checks with PTP clock
+          // TODO: add timestamp sanity checks with PTP clock
 
-        let stride = num_channels * sd.bytes_per_sample;
-        let samples_count = audio_bytes.len() / stride;
-        //info!("first byte = {}, assuming {} samples in {} channels", buf[0], samples_count, num_channels);
-        for (i, ch) in sd.channels.iter_mut().enumerate() {
-          if let Some(ch) = ch {
-            let reader = SamplesReader {
-              bytes: audio_bytes,
-              read_pos: i * sd.bytes_per_sample,
-              stride,
-              remaining_samples: samples_count,
-            };
-            match sd.bytes_per_sample {
-              2 => ch.sink.write_from_at(timestamp, S16ReaderIterator(reader)),
-              3 => ch.sink.write_from_at(timestamp, S24ReaderIterator(reader)),
-              4 => ch.sink.write_from_at(timestamp, S32ReaderIterator(reader)),
-              other => {
-                error!("BUG: unsupported bytes per sample {}", other);
-                return Command::NoOp;
+          let stride = num_channels * sd.bytes_per_sample;
+          let samples_count = audio_bytes.len() / stride;
+          //info!("first byte = {}, assuming {} samples in {} channels", buf[0], samples_count, num_channels);
+          for (i, ch) in sd.channels.iter_mut().enumerate() {
+            if let Some(ch) = ch {
+              let reader = SamplesReader {
+                bytes: audio_bytes,
+                read_pos: i * sd.bytes_per_sample,
+                stride,
+                remaining_samples: samples_count,
+              };
+              match sd.bytes_per_sample {
+                // FIXME: in ALSA plugin timestamp should be shifted by channel latency into the future to avoid dropouts
+                // FIXME: in ALSA plugin there can be more than 1 sink per input channel because we skip SamplesCollector !!!
+                2 => ch.sink.write_from_at(timestamp, S16ReaderIterator(reader)),
+                3 => ch.sink.write_from_at(timestamp, S24ReaderIterator(reader)),
+                4 => ch.sink.write_from_at(timestamp, S32ReaderIterator(reader)),
+                other => {
+                  error!("BUG: unsupported bytes per sample {}", other);
+                  return Command::NoOp;
+                }
               }
             }
           }
+          //(sd.callback)(src, &buf[..recv_size]);
+          sd.last_source = Some(src);
         }
-        //(sd.callback)(src, &buf[..recv_size]);
-        sd.last_source = Some(src);
-      }
-      Err(e) => {
-        error!("flow socket receive error: {:?}", e);
-        // TODO recreate socket?
+        Err(e) => {
+          if e.kind() != WouldBlock {
+            error!("flow socket receive error: {:?}", e);
+            // TODO recreate socket?
+          }
+          break;
+        }
       }
     };
     return Command::NoOp;
   }
-  async fn take_command(receiver: &mut mpsc::Receiver<Command>) -> Command {
+  async fn take_command(receiver: &mut mpsc::Receiver<Command<P>>) -> Command<P> {
     receiver.recv().await.unwrap_or(Command::Shutdown)
   }
   fn run(&mut self) {
@@ -139,6 +148,7 @@ impl FlowsReceiverInternal {
           Ok(command) => match command {
             Command::Shutdown => break,
             Command::AddSocket { index: id, mut socket } => {
+              debug!("adding socket");
               self.poll.registry().register(&mut socket.socket, mio::Token(id), mio::Interest::READABLE).unwrap();
               let previous = std::mem::replace(&mut self.sockets[id], Some(socket));
               debug_assert!(previous.is_none());
@@ -170,6 +180,8 @@ impl FlowsReceiverInternal {
           if let Some(src) = sd.last_source {
             if let Err(e) = sd.socket.send_to(&KEEPALIVE_CONTENT, src) {
               error!("failed to send keepalive to {src:?}: {e:?}");
+            } else {
+              trace!("sent keepalive");
             }
           }
         }
@@ -183,13 +195,13 @@ impl FlowsReceiverInternal {
   }
 }
 
-pub struct FlowsReceiver {
-  commands_sender: mpsc::Sender<Command>,
+pub struct FlowsReceiver<P: ProxyToSamplesBuffer> {
+  commands_sender: mpsc::Sender<Command<P>>,
   waker: mio::Waker
 }
 
-impl FlowsReceiver {
-  fn run(rx: mpsc::Receiver<Command>, poll: mio::Poll, sample_rate: u32, ref_instant: Instant) {
+impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
+  fn run(rx: mpsc::Receiver<Command<P>>, poll: mio::Poll, sample_rate: u32, ref_instant: Instant) {
     let mut internal =
       FlowsReceiverInternal { commands_receiver: rx, sockets: (0..MAX_FLOWS).map(|_|None).collect_vec(), poll, sample_rate, ref_instant };
     internal.run();
@@ -237,7 +249,7 @@ impl FlowsReceiver {
     self.commands_sender.send(Command::RemoveSocket { index: local_index }).await.log_and_forget();
     self.waker.wake().log_and_forget();
   }
-  pub async fn connect_channel(&self, local_index: usize, channel_index: usize, sink: RBInput<Sample>) {
+  pub async fn connect_channel(&self, local_index: usize, channel_index: usize, sink: RBInput<Sample, P>) {
     debug!("connecting channel: flow index={local_index}, channel in flow: {channel_index}");
     self
       .commands_sender

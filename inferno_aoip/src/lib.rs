@@ -1,5 +1,5 @@
 // Inferno-AoIP
-// Copyright (C) 2023 Teodor Woźniak
+// Copyright (C) 2023-2024 Teodor Woźniak
 // 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -45,6 +45,7 @@
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() {
 //!   let self_info = DeviceInfo::new_self("My Inferno device", "MyInferno", None).make_rx_channels(16);
+//!   // TODO: update line below with proper start_* function
 //!   let server = DeviceServer::start(self_info, Box::new(audio_callback)).await;
 //!   let _ = tokio::signal::ctrl_c().await;
 //!   server.shutdown().await;
@@ -71,6 +72,7 @@ mod net_utils;
 mod os_utils;
 mod protocol;
 mod real_time_box_channel;
+mod ring_buffer;
 mod samples_collector;
 mod samples_utils;
 mod state_storage;
@@ -79,7 +81,9 @@ mod thread_utils;
 pub use common::Sample;
 pub use device_info::DeviceInfo;
 pub use device_server::{DeviceServer, SelfInfoBuilder};
-pub use media_clock::MediaClock;
+pub use media_clock::{MediaClock, RealTimeClockReceiver};
+pub use ring_buffer::ExternalBufferParameters;
+pub type AtomicSample = atomic::Atomic<Sample>;
 
 pub mod utils {
   pub use crate::os_utils::set_current_thread_realtime;
