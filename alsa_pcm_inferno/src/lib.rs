@@ -25,6 +25,7 @@ struct MyIOPlug {
     media_clock: MediaClock,
     clock_receiver: Option<RealTimeClockReceiver>,
     start_time: Option<usize>,
+    start_time_tx: Option<tokio::sync::oneshot::Sender<usize>>,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -44,6 +45,7 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
     if now_samples_opt.is_some() && this.start_time.is_none() {
         this.start_time = now_samples_opt;
+        this.start_time_tx.take().unwrap().send(now_samples_opt.unwrap()).expect("failed to send start timestamp");
     }
     now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
 }
@@ -115,9 +117,10 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     let (tx, rx) = std::sync::mpsc::channel();
 
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let (start_time_tx, start_time_rx) = tokio::sync::oneshot::channel::<usize>();
 
     let inferno_thread = run_future_in_new_thread("Inferno main", move || async move {
-        let (mut device_server, clock_receiver) = DeviceServer::start_with_external_buffering(self_info, rx_channels_buffers).await;
+        let (mut device_server, clock_receiver) = DeviceServer::start_with_external_buffering(self_info, rx_channels_buffers, start_time_rx).await;
         //let tx_inputs = device_server.take_tx_inputs();
         let self_info = device_server.self_info.clone();
         tx.send((self_info, clock_receiver)).log_and_forget();
@@ -128,6 +131,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     let (self_info, clock_receiver) = rx.recv().unwrap();
     this.clock_receiver = Some(clock_receiver);
     this.stop_tx = Some(stop_tx);
+    this.start_time_tx = Some(start_time_tx);
     *this.buffers_valid.write().unwrap() = true;
 
     0
@@ -167,6 +171,7 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, _name: *const c_ch
         media_clock: MediaClock::new(),
         clock_receiver: None,
         start_time: None,
+        start_time_tx: None,
         stop_tx: None,
     }));
 

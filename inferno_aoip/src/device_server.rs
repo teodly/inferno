@@ -101,7 +101,7 @@ pub struct DeviceServer {
 
 impl DeviceServer {
   pub async fn start_with_recv_callback(self_info: DeviceInfo, samples_callback: SamplesCallback) -> Self {
-    Self::start::<OwnedBuffer<Atomic<Sample>>, OwnedBuffering>(self_info, |si: &Arc<DeviceInfo>, workers, _| {
+    Self::start::<OwnedBuffer<Atomic<Sample>>, OwnedBuffering>(self_info, None, |si: &Arc<DeviceInfo>, workers, _| {
       let (sc, future) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(si.clone(), Box::new(samples_callback));
       workers.push(tokio::spawn(future));
       OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(sc))
@@ -110,7 +110,7 @@ impl DeviceServer {
   pub async fn start_with_realtime_receiver(self_info: DeviceInfo) -> (Self, RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>>, RealTimeBoxReceiver<Option<ClockOverlay>>) {
     let mut rt_recv = None;
     let mut clk = None;
-    (Self::start(self_info, |si: &Arc<DeviceInfo>, workers, clkrcv: &ClockReceiver| {
+    (Self::start(self_info, None, |si: &Arc<DeviceInfo>, workers, clkrcv: &ClockReceiver| {
       let (col, col_fut, rtr) = SamplesCollector::new_realtime(si.clone(), clkrcv.subscribe());
       rt_recv = Some(rtr);
       clk = Some(clkrcv.subscribe());
@@ -118,14 +118,14 @@ impl DeviceServer {
       OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col))
     }).await, rt_recv.unwrap(), async_clock_receiver_to_realtime(clk.unwrap()))
   }
-  pub async fn start_with_external_buffering(self_info: DeviceInfo, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>) -> (Self, RealTimeClockReceiver) {
+  pub async fn start_with_external_buffering(self_info: DeviceInfo, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>) -> (Self, RealTimeClockReceiver) {
     let mut clk = None;
-    (Self::start::<ExternalBuffer<Atomic<Sample>>, ExternalBuffering>(self_info, |si: &Arc<DeviceInfo>, workers, clkrcv| {
+    (Self::start::<ExternalBuffer<Atomic<Sample>>, ExternalBuffering>(self_info, Some(start_time_rx), |si: &Arc<DeviceInfo>, workers, clkrcv| {
       clk = Some(clkrcv.subscribe());
       ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/)
     }).await, async_clock_receiver_to_realtime(clk.unwrap()))
   }
-  pub async fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(self_info: DeviceInfo, create_rx_buffering: impl FnOnce(&Arc<DeviceInfo>, &mut Vec<JoinHandle<()>>, &ClockReceiver) -> B) -> Self {
+  pub async fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(self_info: DeviceInfo, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, create_rx_buffering: impl FnOnce(&Arc<DeviceInfo>, &mut Vec<JoinHandle<()>>, &ClockReceiver) -> B) -> Self {
     let self_info = Arc::new(self_info);
     let state_storage = Arc::new(StateStorage::new(&self_info));
     let ref_instant = Instant::now();
@@ -136,7 +136,7 @@ impl DeviceServer {
     let shdn_recv4 = shutdown_send.subscribe();
     let mdns_handle = crate::mdns_server::start_server(self_info.clone());
 
-    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self_info.clone(), ref_instant);
+    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self_info.clone(), ref_instant, start_time_rx);
     let flows_rx_handle = Arc::new(flows_rx_handle);
 
     let mdns_client = Arc::new(crate::mdns_client::MdnsClient::new(self_info.ip_address));

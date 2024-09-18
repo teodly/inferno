@@ -807,11 +807,12 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
             let local_id = flow.local_id;
             debug_assert!(local_id == remote.local_flow_index+1);
           }
-          let sink_opt = self.channels_buffering.connect_channel(now, &mut flow.channels_rb_outputs[remote.channel_in_flow], chi, flow.latency_samples);
+          let latency_samples = flow.latency_samples;
+          let sink_opt = self.channels_buffering.connect_channel(now, &mut flow.channels_rb_outputs[remote.channel_in_flow], chi, latency_samples);
           if let Some(sink) = sink_opt {
             let flows_recv = self.flows_recv.clone();
             tokio::spawn(async move {
-              flows_recv.connect_channel(remote.local_flow_index, remote.channel_in_flow, sink).await;
+              flows_recv.connect_channel(remote.local_flow_index, remote.channel_in_flow, sink, latency_samples).await;
             });
           }
           subscription.remote = Some(remote);
