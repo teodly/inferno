@@ -15,8 +15,8 @@ impl StateStorage {
   pub fn new(self_info: &DeviceInfo) -> Self {
     let dir = AppDirs::new(Some("inferno_aoip"), false).unwrap().
       state_dir.to_str().unwrap().to_owned() +
-    MAIN_SEPARATOR_STR +
-    &hex::encode(self_info.factory_device_id);
+      MAIN_SEPARATOR_STR +
+      &hex::encode(self_info.factory_device_id);
     create_dir_all(&dir).log_and_forget();
     info!("using state directory: {dir}");
     Self { path_prefix: dir + MAIN_SEPARATOR_STR }

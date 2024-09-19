@@ -57,6 +57,7 @@ pub struct SubscriptionInfo {
   pub status: SubscriptionStatus,
 }
 
+#[derive(Debug)]
 pub struct ChannelsSubscriber {
   commands_sender: mpsc::Sender<Command>,
   subscriptions_info: Arc<RwLock<Vec<Option<SubscriptionInfo>>>>,

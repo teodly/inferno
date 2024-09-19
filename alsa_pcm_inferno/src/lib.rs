@@ -16,6 +16,7 @@ struct StreamInfo {
     boundary: usize,
 }
 
+
 #[repr(C)]
 struct MyIOPlug {
     io: snd_pcm_ioplug_t,
@@ -27,6 +28,7 @@ struct MyIOPlug {
     start_time: Option<usize>,
     start_time_tx: Option<tokio::sync::oneshot::Sender<usize>>,
     stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    // TODO refactor multiple Options to single Option<struct>
 }
 
 unsafe fn get_private<'a>(io: *mut snd_pcm_ioplug_t) -> &'a mut MyIOPlug {
@@ -99,14 +101,14 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     assert!(boundary != 0);
     println!("boundary: {boundary}");
     this.stream_info = Some(StreamInfo {
-        boundary: boundary as usize
+        boundary: boundary as usize // TODO use this
     });
 
     let app_name = get_app_name().unwrap_or(std::process::id().to_string());
     let logenv = env_logger::Env::default().default_filter_or("debug");
     env_logger::builder().parse_env(logenv).format_timestamp_micros().init();
 
-    let self_info = DeviceInfo::new_self(&format!("{app_name} (via Inferno-AoIP)"), &app_name, None).make_rx_channels(2).make_tx_channels(32);
+    let self_info = DeviceInfo::new_self(&format!("{app_name} (via Inferno-AoIP)"), &app_name, None).make_rx_channels(2).make_tx_channels(2);
     // TODO make tx & rx channels based on (*io).channels
     // this requires a complicated refactor to allow adding channels to the Dante network dynamically at any time, not just on DeviceServer start
     // because we don't know beforehand whether the app will be capture&playback, playback-only or capture-only
@@ -162,7 +164,7 @@ unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
 
 
 
-unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, _name: *const c_char, _root: *const snd_config_t, _conf: *const snd_config_t, _stream: snd_pcm_stream_t, _mode: c_int) -> c_int {
+unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_char, root: *const snd_config_t, conf: *const snd_config_t, stream: snd_pcm_stream_t, mode: c_int) -> c_int {
     let myio = Box::into_raw(Box::new(MyIOPlug {
         io: zeroed(),
         ref_time: Instant::now(),
@@ -191,7 +193,7 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, _name: *const c_ch
     io.private_data = myio as *mut _;
 
     // TODO error handling
-    snd_pcm_ioplug_create(io, _name, _stream, _mode, 0);
+    snd_pcm_ioplug_create(io, name, stream, mode, 0);
 
     snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_FORMAT as i32, 1, [SND_PCM_FORMAT_S32 as u32].as_ptr());
     //snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_ACCESS as i32, 2, [SND_PCM_ACCESS_MMAP_INTERLEAVED as u32, SND_PCM_ACCESS_MMAP_NONINTERLEAVED as u32].as_ptr());

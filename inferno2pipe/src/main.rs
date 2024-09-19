@@ -60,7 +60,8 @@ async fn main() {
     output_file.write_all(&buffer[..len]).unwrap_or_else(|e| error!("error writing output: {e:?}"));
   };
 
-  let server = DeviceServer::start_with_recv_callback(self_info, Box::new(write_callback)).await;
+  let mut server = DeviceServer::start(self_info).await;
+  server.receive_with_callback(Box::new(write_callback)).await;
   let _ = tokio::signal::ctrl_c().await;
   server.shutdown().await;
 }

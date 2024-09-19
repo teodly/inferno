@@ -13,9 +13,10 @@ use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
 pub async fn run_server(
   self_info: Arc<DeviceInfo>,
-  channels_recv: Arc<ChannelsSubscriber>,
+  mut channels_recv_rx: tokio::sync::oneshot::Receiver<Arc<ChannelsSubscriber>>,
   shutdown: BroadcastReceiver<()>,
 ) {
+  let mut channels_recv = None;
   let server = UdpSocketWrapper::new(Some(self_info.ip_address), PORT, shutdown);
   let mut conn = req_resp::Connection::new(server);
   while conn.should_work() {
@@ -23,6 +24,16 @@ pub async fn run_server(
       Some(v) => v,
       None => continue,
     };
+
+    if channels_recv.is_none() {
+      match channels_recv_rx.try_recv() {
+        Ok(v) => {
+          channels_recv = Some(v);
+        },
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+      }
+    }
 
     if request.opcode2().read() == 0 {
       match request.opcode1().read() {
@@ -146,7 +157,7 @@ pub async fn run_server(
           0x31, 0x00, 0x32, 0x00]);*/
           let content = request.content();
           let start_index = make_u16(content[2], content[3]) - 1;
-          let remaining = self_info.rx_channels.len() - start_index as usize;
+          let remaining = if channels_recv.is_some() { self_info.rx_channels.len().saturating_sub(start_index as usize) } else { 0 };
           let limit = 16;
           let in_this_response = min(limit, remaining);
           trace!("returning {in_this_response} rx channels starting with index {start_index}");
@@ -168,7 +179,7 @@ pub async fn run_server(
             response.write_u16((i + 1) as u16); // channel id
             response.write_u16(6); // ???
             response.write_u16(common_descr_offset as u16);
-            let status = channels_recv.channel_status(i);
+            let status = channels_recv.as_ref().unwrap().channel_status(i);
             let (tx_ch_offset, tx_host_offset) = match &status {
               None => (0, 0),
               Some(status) => {
@@ -370,47 +381,49 @@ pub async fn run_server(
         0x3010 => {
           // subscribe (connect our receiver to remote transmitter)
           // or unsubscribe if tx_*_offset is 0
-          let c_whole = request.content();
-          let count = c_whole[1] as usize;
-          for i in 0..count {
-            let c = &c_whole[2 + i * 6..];
-            let local_channel = make_u16(c[0], c[1]);
-            let tx_channel_offset = make_u16(c[2], c[3]) as usize;
-            let tx_hostname_offset = make_u16(c[4], c[5]) as usize;
-            let local_channel_index = (local_channel - 1) as usize;
-            if tx_channel_offset > 0 && tx_hostname_offset > 0 {
-              let str_or_none = |offset| match offset {
-                _ if offset < HEADER_LENGTH => None,
-                v => match read_0term_str_from_buffer(&c_whole, v - HEADER_LENGTH) {
-                  Ok(s) => Some(s),
-                  Err(e) => {
-                    error!("failed to decode string: {e:?}");
-                    None
-                  }
-                },
-              };
-              let tx_channel_name = str_or_none(tx_channel_offset);
-              let tx_hostname = str_or_none(tx_hostname_offset);
-              info!(
-                "connection requested: {} <- {:?} @ {:?}",
-                local_channel, tx_channel_name, tx_hostname
-              );
-              if tx_channel_name.is_some() && tx_hostname.is_some() {
-                channels_recv
-                  .subscribe(local_channel_index, tx_channel_name.unwrap(), tx_hostname.unwrap())
-                  .await;
-              } else {
-                error!(
-                  "couldn't read tx names from subscription request: {}",
-                  hex::encode(&c_whole)
+          if let Some(channels_recv) = &channels_recv {
+            let c_whole = request.content();
+            let count = c_whole[1] as usize;
+            for i in 0..count {
+              let c = &c_whole[2 + i * 6..];
+              let local_channel = make_u16(c[0], c[1]);
+              let tx_channel_offset = make_u16(c[2], c[3]) as usize;
+              let tx_hostname_offset = make_u16(c[4], c[5]) as usize;
+              let local_channel_index = (local_channel - 1) as usize;
+              if tx_channel_offset > 0 && tx_hostname_offset > 0 {
+                let str_or_none = |offset| match offset {
+                  _ if offset < HEADER_LENGTH => None,
+                  v => match read_0term_str_from_buffer(&c_whole, v - HEADER_LENGTH) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                      error!("failed to decode string: {e:?}");
+                      None
+                    }
+                  },
+                };
+                let tx_channel_name = str_or_none(tx_channel_offset);
+                let tx_hostname = str_or_none(tx_hostname_offset);
+                info!(
+                  "connection requested: {} <- {:?} @ {:?}",
+                  local_channel, tx_channel_name, tx_hostname
                 );
+                if tx_channel_name.is_some() && tx_hostname.is_some() {
+                  channels_recv
+                    .subscribe(local_channel_index, tx_channel_name.unwrap(), tx_hostname.unwrap())
+                    .await;
+                } else {
+                  error!(
+                    "couldn't read tx names from subscription request: {}",
+                    hex::encode(&c_whole)
+                  );
+                }
+              } else {
+                info!("disconnect requested: local channel {}", local_channel);
+                channels_recv.unsubscribe(local_channel_index).await;
               }
-            } else {
-              info!("disconnect requested: local channel {}", local_channel);
-              channels_recv.unsubscribe(local_channel_index).await;
             }
+            conn.respond(&[]).await;
           }
-          conn.respond(&[]).await;
         }
         x => {
           error!("received unknown opcode1 {x:#04x}, content {}", hex::encode(request.content()));

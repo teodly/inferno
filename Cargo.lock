@@ -43,6 +43,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "inferno_aoip",
+ "lazy_static",
  "libc",
  "log",
  "tokio",
