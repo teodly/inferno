@@ -5,15 +5,42 @@ Highly experimental for now. I don't recommend using it for serious purposes.
 However, chances that it'll break already working Dante network are low.
 
 # Features
-* receiving audio from Dante devices
+* receiving audio from and sending audio to Dante devices and virtual devices
 * connections can be made using Dante Controller or [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) (`netaudio` command line tool)
+
+## Comparison
+
+|   | **Inferno** | [DVS](https://www.getdante.com/products/software-essentials/dante-virtual-soundcard) | [AES67 Linux daemon](https://github.com/bondagit/aes67-linux-daemon) |
+|---|---|---|---|
+| Maturity | 💣 Alpha | ✅ Production-ready | ✅ Probably stable |
+| Platforms | Linux  | Mac, Windows  | Linux |
+| Supported protocols | Dante | Dante | AES67 |
+| Works with DAWs | 💣 try PipeWire plugin if you're brave | ✅ Yes | ✅ Yes |
+| Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
+| Configurable using Dante Controller | ⏳ Mostly not yet | ✅ Yes | 🚫 No |
+| Compatible with Dante Domain Manager | 🚫 No | ✅ Yes | 🚫 No (but AES67 integration possible) |
+| Supported clock protocols | PTPv2 ✅, [experimental PTPv1](https://github.com/teodly/statime/tree/ptpv1-hack) 💣 | PTPv1 ✅ | PTPv2 ✅ |
+| Clock leader | PTPv2 ✅ via [Statime](https://github.com/pendulum-project/statime) | 🚫 No (but possible in Dante Via) | ✅ via external daemon |
+| Stream audio from/to modern Dante hardware | ✅ Yes | ✅ Yes | ✅ Yes |
+| Stream audio from/to DVS & Dante Via | ✅ Yes | ✅ Yes | 🚫 No  |
+| Stream audio from/to AES67           | 🚫 No  | 🚫 No  | ✅ Yes |
+| Sends & receives multicasts | ⏳ Not yet | ✅ Yes | ✅ Yes |
+| OS integration | Entirely user-space | Kernel driver & user-space services | Kernel driver & user-space helper |
+| Supported audio backends | ALSA, PipeWire | CoreAudio, ASIO, WDM | ALSA |
+| Lightweight recording app | ✅ Yes (Inferno2pipe) | 🚫 No | ✅ FFmpeg with RTP input does the trick |
+| Disk space & RAM usage | 🌱 Low (~12MB RAM) | 🔥 High | 🌱 Low |
+| Written in | Rust | C++, Java | C++, C |
+| License | 🥰 FOSS, copyleft | 🔒 Closed source | 🥰 FOSS, copyleft |
+| [DRM](https://drm.info/what-is-drm.en.html) | ✅ No | 🔒 Actiation required, virtual machines banned | ✅ No |
+| Price   | Free of charge | 🤑 50-80 USD ... *for a **device driver*** | Free of charge |
+| Privacy | 😊 No tracking | 😡 Registration required, telemetry enabled by default | 😊 No tracking |
 
 
 ## Quirks, read it before using:
 * Dante protocol is undocumented. Everything was reverse-engineered or based on other reverse-engineering projects. Some things in implementation were guessed. So while it works with my setup, it may not work with yours.
 * channel names can't be changed. If you try to change them, Dante Controller may get confused
 * receiving from multicast flows isn't supported yet, unicast connection will be made
-* clocked by incoming media flows. When nothing is connected, "time will stop" (i.e. recording will pause) until something is connected again - silence won't be generated unless at least one channel is connected.
+* Inferno2pipe is clocked by incoming media flows. When nothing is connected, "time will stop" (i.e. recording will pause) until something is connected again - silence won't be generated unless at least one channel is connected.
 * it will not start if there is no default route in OS routing table
 
 Disclaimer: Dante uses technology patented by Audinate. This source code may use these patents too. Consult a lawyer if you want to:
@@ -37,18 +64,19 @@ This project makes no claim to be either authorized or approved by Audinate.
 * Audinate AVIO AES3
 * Ben & Fellows 523019 4x4 balanced analog I/O module (based on Dante UltimoX4)
 * Klark Teknik DN32-DANTE (based on Dante Brooklyn II)
+* Soundcraft Vi2000
 * Dante Via @ OS X
 * Dante Virtual Soundcard @ Windows 10
 
 ## Control software
-* Dante Controller @ Windows 11
+* Dante Controller @ Windows 10, 11
 * network-audio-controller
 
 ## Host
 * x86_64 Linux
   * Arch
   * Ubuntu
-
+  * Fedora
 
 # Anatomy of the repository
 * `inferno_aoip` - main library crate for emulating a Dante audio over IP device. In the future controller functionality will also be implemented. **Start here if you want to develop your app based on Inferno**.
@@ -93,7 +121,6 @@ likely in order they'll be implementated
 
 At this point, Inferno will roughly become alternative to Dante Virtual Soundcard.
 
-* improve performance of receiver. Currently it's implemented with coroutines which is not very optimal for processing thousands of packets per second.
 * integration with JACK
 * send statistics (clock, latency, signal levels)
 * ability to work as a clock source (PTP leader)
@@ -106,7 +133,7 @@ At this point, Inferno will roughly become alternative to Dante Virtual Soundcar
 
 
 # Design
-* 99.9% safe Rust (unsafe is required only because PipeWire Rust bindings return raw buffers)
+* 99% safe Rust (unsafe is required only because PipeWire Rust bindings return raw buffers and because ALSA plugin API doesn't have safe Rust bindings)
 * no external libraries needed, the only dependencies are Rust crates
 
 

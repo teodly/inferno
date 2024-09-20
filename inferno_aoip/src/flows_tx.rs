@@ -57,8 +57,6 @@ impl Flow {
 }
 
 
-
-
 #[derive(Debug)]
 enum Command {
   NoOp,
@@ -76,6 +74,7 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   clock: MediaClock,
   channels_sources: Vec<RBOutput<Sample, P>>,
   send_latency_samples: usize,
+  timestamp_shift: ClockDiff,
   //callback: SamplesRequestCallback,
 }
 
@@ -115,7 +114,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           let subsec_samples = packet_ts % (sample_rate as Clock);
           pbuff[1..5].copy_from_slice(&(seconds as u32).to_be_bytes());
           pbuff[5..9].copy_from_slice(&(subsec_samples as u32).to_be_bytes());
-          let start_ts = flow.next_ts.wrapping_sub(self.send_latency_samples);
+          let start_ts = flow.next_ts.wrapping_add_signed(self.timestamp_shift);
           for (index_in_flow, &ch_opt) in flow.channel_indices.iter().enumerate() {
             if let Some(ch_index) = ch_opt {
               //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
@@ -171,10 +170,22 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       error!("clock unavailable, can't transmit. is the PTP daemon running?");
     }
   }
-  async fn run(&mut self) {
+  async fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
     let sample_rate = self.sample_rate;
     let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
     let mut counter = Wrapping(0u32);
+
+    if let Some(rx) = &mut start_time_rx {
+      match rx.await {
+        Ok(start_time) => {
+          self.timestamp_shift = 0isize.wrapping_sub_unsigned(start_time).wrapping_sub_unsigned(self.send_latency_samples);
+        },
+        Err(e) => {
+          panic!("unable to get start timestamp for ring buffer output: {e:?}");
+        }
+      }
+    }
+
     set_current_thread_realtime(89);
     loop {
       let min_next_ts = self.flows.iter().filter_map(|opt|opt.as_ref()).map(|&ref flow|flow.next_ts).min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
@@ -270,14 +281,16 @@ fn split_handle(h: FlowHandle) -> (u32, u16) {
 }
 
 impl FlowsTransmitter {
-  async fn run<P: ProxyToSamplesBuffer>(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample, P>>) {
+  async fn run<P: ProxyToSamplesBuffer>(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
+    let latency = latency_ns * sample_rate as usize / 1_000_000_000;
     let mut internal = FlowsTransmitterInternal {
       commands_receiver: rx,
       sample_rate,
       flows: (0..MAX_FLOWS).map(|_|None).collect_vec(),
       clock: MediaClock::new(),
       channels_sources: channels_outputs,
-      send_latency_samples: latency_ns * sample_rate as usize / 1_000_000_000,
+      send_latency_samples: latency,
+      timestamp_shift: 0isize.wrapping_sub_unsigned(latency),
       /* callback: Box::new(|mut timestamp: Clock, ch_index: usize, buffer: &mut [Sample]| {
         let period = 4 << ch_index;
         for sample in buffer {
@@ -287,9 +300,9 @@ impl FlowsTransmitter {
         }
       }) */
     };
-    internal.run().await;
+    internal.run(start_time_rx).await;
   }
-  pub fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static>(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>, channels_outputs: Vec<RBOutput<Sample, P>>) -> (Self, JoinHandle<()>) {
+  pub fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static>(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
     tokio::spawn(async move {
@@ -310,7 +323,7 @@ impl FlowsTransmitter {
     });
     let srate = self_info.sample_rate;
     // TODO dehardcode latency_ns
-    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 30_000_000, channels_outputs).boxed_local());
+    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 1_000_000, channels_outputs, start_time_rx).boxed_local());
     return (Self {
       commands_sender: tx,
       self_info: self_info.clone(),

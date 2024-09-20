@@ -10,6 +10,7 @@ pub trait ProxyToBuffer<T> {
   /// If buffer is available, executes `cb` with buffer's slice as an argument and returns Some with its result
   /// If buffer is unavailable, returns None
   fn map<R>(&self, cb: impl FnOnce(&[T]) -> R) -> Option<R>;
+  fn unconditional_read(&self) -> bool;
 }
 
 pub trait ProxyToSamplesBuffer: ProxyToBuffer<Atomic<Sample>> {
@@ -32,6 +33,9 @@ impl<T> ProxyToBuffer<T> for OwnedBuffer<T> {
   #[inline(always)]
   fn map<R>(&self, cb: impl FnOnce(&[T]) -> R) -> Option<R> {
     Some(cb(self.0.as_slice()))
+  }
+  fn unconditional_read(&self) -> bool {
+    false
   }
 }
 
@@ -80,6 +84,9 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
     } else {
       None
     }
+  }
+  fn unconditional_read(&self) -> bool {
+    true
   }
 }
 
@@ -246,15 +253,19 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
   /// Use the method `read_done` when reads of all `RBOutput`s sharing the same ring buffer are done.
   pub fn read_at(&self, start_timestamp: Clock, output: &mut [T]) -> ReadResult {
     // in normal case: start_ts < readable_pos <= writing_pos
-    let readable = wrapped_diff(self.rb.readable_pos.load(Ordering::Acquire), start_timestamp);
-    if readable < 0 || readable > self.rb.items_size.try_into().unwrap() {
-      debug!("readable {readable}, items_size {}", self.rb.items_size);
-      // we're trying to read not yet written data, or we're lagging behind so much that data at that timestamp has already been overwritten
-      return ReadResult { useful_start_index: 0, useful_end_index: 0 };
-    }
-    let readable = readable as usize;
-    let original_output_len = output.len();
-    let output_len = original_output_len.min(readable);
+    let output_len = if self.rb.buffer.unconditional_read() {
+      output.len()
+    } else {
+      let readable = wrapped_diff(self.rb.readable_pos.load(Ordering::Acquire), start_timestamp);
+      if readable < 0 || readable > self.rb.items_size.try_into().unwrap() {
+        debug!("readable {readable}, items_size {}", self.rb.items_size);
+        // we're trying to read not yet written data, or we're lagging behind so much that data at that timestamp has already been overwritten
+        return ReadResult { useful_start_index: 0, useful_end_index: 0 };
+      }
+      let readable = readable as usize;
+      let original_output_len = output.len();
+      original_output_len.min(readable)
+    };
 
     //let wrapped_start_ts = start_timestamp % self.rb.items_size;
     //let wrapped_end_ts = start_timestamp.wrapping_add(output_len) % self.rb.items_size;
@@ -271,12 +282,14 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
       return ReadResult { useful_start_index: 0, useful_end_index: 0 };
     }
 
-    let writing_pos = self.rb.writing_pos.load(Ordering::Acquire);
-    let diff = wrapped_diff(writing_pos, start_timestamp);
-    if diff > self.rb.items_size.try_into().unwrap() {
-      // data has been overwritten in the meantime, so some data at the beginning of the buffer may be wrong
-      let overwritten = diff as usize - self.rb.items_size;
-      return ReadResult { useful_start_index: overwritten.min(output_len), useful_end_index: output_len };
+    if !self.rb.buffer.unconditional_read() {
+      let writing_pos = self.rb.writing_pos.load(Ordering::Acquire);
+      let diff = wrapped_diff(writing_pos, start_timestamp);
+      if diff > self.rb.items_size.try_into().unwrap() {
+        // data has been overwritten in the meantime, so some data at the beginning of the buffer may be wrong
+        let overwritten = diff as usize - self.rb.items_size;
+        return ReadResult { useful_start_index: overwritten.min(output_len), useful_end_index: output_len };
+      }
     }
 
     ReadResult { useful_start_index: 0, useful_end_index: output_len }
