@@ -47,6 +47,9 @@ lazy_static! {
 fn init_common(self_info: DeviceInfo) {
     let mut common_opt = inferno_global.lock().unwrap();
     if common_opt.is_none() {
+        let logenv = env_logger::Env::default().default_filter_or("debug");
+        env_logger::builder().parse_env(logenv).format_timestamp_micros().init();
+        
         //self_info.sample_rate = sample_rate;
         // TODO make tx & rx channels based on (*io).channels
         // this requires a complicated refactor to allow adding channels to the Dante network dynamically at any time, not just on DeviceServer start
@@ -310,7 +313,7 @@ unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
 }
 
 unsafe extern "C" fn plugin_transfer(io: *mut snd_pcm_ioplug_t, areas: *const snd_pcm_channel_area_t, offset: snd_pcm_uframes_t, size: snd_pcm_uframes_t) -> snd_pcm_sframes_t {
-    println!("plugin_transfer called, size: {:?}", size);
+    //println!("plugin_transfer called, size: {:?}", size);
     size as snd_pcm_sframes_t
 }
 
@@ -323,9 +326,7 @@ unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
 
 unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_char, root: *const snd_config_t, conf: *const snd_config_t, stream: snd_pcm_stream_t, mode: c_int) -> c_int {
     let app_name = get_app_name().unwrap_or(std::process::id().to_string());
-    let logenv = env_logger::Env::default().default_filter_or("debug");
-    env_logger::builder().parse_env(logenv).format_timestamp_micros().init();
-    
+
     let myio = Box::into_raw(Box::new(MyIOPlug {
         io: zeroed(),
         callbacks: snd_pcm_ioplug_callback_t {
@@ -333,7 +334,7 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
             start: Some(plugin_start),
             stop: Some(plugin_stop),
             pointer: Some(plugin_pointer),
-            transfer: Some(plugin_transfer),
+            //transfer: Some(plugin_transfer),
             close: Some(plugin_close),
             ..zeroed()
         },
