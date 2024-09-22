@@ -1,10 +1,12 @@
 use std::net::Ipv4Addr;
 
+#[derive(Clone)]
 pub struct Channel {
   pub factory_name: String,
   pub friendly_name: String,
 }
 
+#[derive(Clone)]
 pub struct DeviceInfo {
   pub ip_address: Ipv4Addr,
   pub board_name: String,

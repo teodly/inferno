@@ -3,6 +3,7 @@ use crate::flows_tx::FlowsTransmitter;
 use crate::info_mcast_server::MulticastMessage;
 use crate::mdns_client::MdnsClient;
 use crate::media_clock::{async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver};
+use crate::protocol::flows_control;
 use crate::real_time_box_channel::RealTimeBoxReceiver;
 use crate::samples_collector::{RealTimeSamplesReceiver, SamplesCallback, SamplesCollector};
 use crate::state_storage::StateStorage;
@@ -22,11 +23,12 @@ use std::mem::size_of;
 use std::env;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, RwLock};
 
 use std::net::IpAddr;
 use std::time::Instant;
-use tokio::sync::{broadcast as broadcast_queue, mpsc};
+use tokio::sync::{broadcast as broadcast_queue, mpsc, watch};
 
 use crate::device_info::{Channel, DeviceInfo};
 
@@ -97,6 +99,7 @@ impl SelfInfoBuilder for DeviceInfo {
   }
 }
 
+
 pub struct DeviceServer {
   pub self_info: Arc<DeviceInfo>,
   ref_instant: Instant,
@@ -105,10 +108,12 @@ pub struct DeviceServer {
   shared_media_clock: Arc<RwLock<MediaClock>>,
   mdns_client: Arc<MdnsClient>,
   mcast_tx: mpsc::Sender<MulticastMessage>,
-  channels_sub_tx: Option<tokio::sync::oneshot::Sender<Arc<ChannelsSubscriber>>>,
+  channels_sub_tx: watch::Sender<Option<Arc<ChannelsSubscriber>>>,
   //tx_inputs: Vec<RBInput<Sample, P>>,
-  tasks: Vec<JoinHandle<()>>,
-  shutdown_todo: VecDeque<Pin<Box<dyn Future<Output = ()> + Send>>>,
+  //tasks: Vec<JoinHandle<()>>,
+  shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>,
+  tx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+  rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
 impl DeviceServer {
@@ -133,7 +138,7 @@ impl DeviceServer {
 
     let mut tasks = vec![];
 
-    let (channels_sub_tx, channels_sub_rx) = tokio::sync::oneshot::channel();
+    let (channels_sub_tx, channels_sub_rx) = watch::channel(None);
 
     tasks.append(&mut vec![
       tokio::spawn(crate::arc_server::run_server(
@@ -150,6 +155,9 @@ impl DeviceServer {
     let shutdown_todo = async move {
       shutdown_send.send(()).unwrap();
       mdns_handle.shutdown().unwrap();
+      for task in tasks {
+        task.await.unwrap();
+      }
     }.boxed();
 
     let shared_media_clock = make_shared_media_clock(&clock_receiver);
@@ -161,33 +169,35 @@ impl DeviceServer {
       shared_media_clock,
       mdns_client,
       mcast_tx,
-      channels_sub_tx: Some(channels_sub_tx),
-      tasks,
+      channels_sub_tx,
+      //tasks,
       //tx_inputs,
-      shutdown_todo: VecDeque::from([shutdown_todo])
+      shutdown_todo,
+      rx_shutdown_todo: None,
+      tx_shutdown_todo: None,
     }
   }
 
   pub async fn receive_with_callback(&mut self, samples_callback: SamplesCallback) {
     let (col, col_fut) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(self.self_info.clone(), Box::new(samples_callback));
-    self.tasks.push(tokio::spawn(col_fut));
+    let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
-    self.receive(None, buffering).await;
+    self.receive(tasks, None, buffering, Default::default()).await;
   }
   pub async fn receive_realtime(&mut self) -> RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>> {
     let (col, col_fut, rt_recv) = SamplesCollector::new_realtime(self.self_info.clone(), self.clock_receiver.subscribe());
-    self.tasks.push(tokio::spawn(col_fut));
+    let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
-    self.receive(None, buffering).await;
+    self.receive(tasks, None, buffering, Default::default()).await;
 
     rt_recv
   }
-  pub async fn receive_to_external_buffer(&mut self, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>) {
+  pub async fn receive_to_external_buffer(&mut self, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>, current_timestamp: Arc<AtomicUsize>) {
     let buffering = ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/);
-    self.receive(Some(start_time_rx), buffering).await;
+    self.receive(vec![], Some(start_time_rx), buffering, current_timestamp).await;
   }
-  async fn receive<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(&mut self, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, channels_buffering: B) {
-    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self.self_info.clone(), self.ref_instant, start_time_rx);
+  async fn receive<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(&mut self, mut tasks: Vec<JoinHandle<()>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, channels_buffering: B, current_timestamp: Arc<AtomicUsize>) {
+    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self.self_info.clone(), self.ref_instant, start_time_rx, current_timestamp);
     let flows_rx_handle = Arc::new(flows_rx_handle);
     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
       self.self_info.clone(),
@@ -200,32 +210,46 @@ impl DeviceServer {
       self.ref_instant,
     );
     let channels_sub_handle = Arc::new(channels_sub_handle);
-    self.channels_sub_tx.take().expect("DeviceServer::receive called more than once").send(channels_sub_handle.clone()).expect("failed to send ChannelsSubscriber handle");
+    let _ = self.channels_sub_tx.send(Some(channels_sub_handle.clone()));
 
-    self.tasks.push(tokio::spawn(channels_sub_worker));
+    tasks.push(tokio::spawn(channels_sub_worker));
 
     let shutdown_todo = async move {
       flows_rx_handle.shutdown().await;
       channels_sub_handle.shutdown().await;
       flows_rx_thread.join().unwrap();
+      for task in tasks {
+        task.await.unwrap();
+      }
     }.boxed();
-    self.shutdown_todo.push_front(shutdown_todo);
+    self.rx_shutdown_todo = Some(shutdown_todo);
+  }
+  pub async fn stop_receiver(&mut self) {
+    let _ = self.channels_sub_tx.send(None);
+    self.rx_shutdown_todo.take().unwrap().await;
   }
 
-  pub async fn transmit_from_external_buffer(&mut self, tx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>) {
+  pub async fn transmit_from_external_buffer(&mut self, tx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>, current_timestamp: Arc<AtomicUsize>) {
     let rb_outputs = tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
-    self.transmit(Some(start_time_rx), rb_outputs).await;
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp).await;
   }
-  async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(&mut self, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, rb_outputs: Vec<RBOutput<Sample, P>>) {
+  async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(&mut self, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, rb_outputs: Vec<RBOutput<Sample, P>>, current_timestamp: Arc<AtomicUsize>) {
     let clock_rx = self.clock_receiver.subscribe();
-    let (flows_tx_handle, flows_tx_thread) = FlowsTransmitter::start(self.self_info.clone(), clock_rx, rb_outputs, start_time_rx);
+    
+    let (flows_tx_handle, flows_tx_thread) = FlowsTransmitter::start(self.self_info.clone(), clock_rx, rb_outputs, start_time_rx, current_timestamp.clone());
     let (shutdown_send, shutdown_recv) = broadcast_queue::channel(16);
-    self.tasks.push(tokio::spawn(crate::flows_control_server::run_server(self.self_info.clone(), flows_tx_handle, shutdown_recv)));
-    self.shutdown_todo.push_front(async move {
+    let flows_control_task = tokio::spawn(crate::flows_control_server::run_server(self.self_info.clone(), flows_tx_handle, shutdown_recv));
+    self.tx_shutdown_todo = Some(async move {
       shutdown_send.send(()).unwrap();
+      flows_control_task.await.unwrap();
       flows_tx_thread.join().unwrap();
     }.boxed());
   }
+  pub async fn stop_transmitter(&mut self) {
+    self.tx_shutdown_todo.take().unwrap().await;
+  }
+
+
   pub fn get_realtime_clock_receiver(&self) -> RealTimeClockReceiver {
     async_clock_receiver_to_realtime(self.clock_receiver.subscribe())
   }
@@ -237,12 +261,13 @@ impl DeviceServer {
 
   pub async fn shutdown(self) {
     info!("shutting down");
-    for todo in self.shutdown_todo {
+    if let Some(todo) = self.rx_shutdown_todo {
       todo.await;
     }
-    for task in self.tasks {
-      task.await.unwrap();
+    if let Some(todo) = self.tx_shutdown_todo {
+      todo.await;
     }
+    self.shutdown_todo.await;
     self.clock_receiver.stop().await.unwrap();
     info!("shutdown ok");
   }

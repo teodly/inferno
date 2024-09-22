@@ -8,7 +8,7 @@ However, chances that it'll break already working Dante network are low.
 * receiving audio from and sending audio to Dante devices and virtual devices
 * connections can be made using Dante Controller or [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) (`netaudio` command line tool)
 
-## Comparison
+## Comparison with other AoIP virtual soundcards
 
 |   | **Inferno** | [DVS](https://www.getdante.com/products/software-essentials/dante-virtual-soundcard) | [AES67 Linux daemon](https://github.com/bondagit/aes67-linux-daemon) |
 |---|---|---|---|

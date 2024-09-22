@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::f64::consts::PI;
 use std::net::{IpAddr, SocketAddrV4, UdpSocket};
 use std::num::Wrapping;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
@@ -75,6 +75,7 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   channels_sources: Vec<RBOutput<Sample, P>>,
   send_latency_samples: usize,
   timestamp_shift: ClockDiff,
+  current_timestamp: Arc<AtomicUsize>,
   //callback: SamplesRequestCallback,
 }
 
@@ -170,6 +171,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       error!("clock unavailable, can't transmit. is the PTP daemon running?");
     }
   }
+
   async fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
     let sample_rate = self.sample_rate;
     let mut dither_rng = SmallRng::from_rng(rand::thread_rng()).unwrap();
@@ -181,19 +183,21 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           self.timestamp_shift = 0isize.wrapping_sub_unsigned(start_time).wrapping_sub_unsigned(self.send_latency_samples);
         },
         Err(e) => {
-          panic!("unable to get start timestamp for ring buffer output: {e:?}");
+          error!("unable to get start timestamp for ring buffer output: {e:?}");
+          return;
         }
       }
     }
 
     set_current_thread_realtime(89);
     loop {
-      let min_next_ts = self.flows.iter().filter_map(|opt|opt.as_ref()).map(|&ref flow|flow.next_ts).min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
+      let min_next_ts = self.flows.iter().filter_map(|opt|opt.as_ref()).filter(|flow|!flow.expired.load(Ordering::Relaxed)).map(|&ref flow|flow.next_ts).min_by(|&a, &b| wrapped_diff(a, b).cmp(&0));
       let sleep_duration = min_next_ts.and_then(|ts|self.clock.system_clock_duration_until(ts, sample_rate as u64)).unwrap_or(std::time::Duration::from_secs(20)).max(MIN_SLEEP);
       let mut process_events = (counter.0%16)==0;
       counter += 1;
 
       let command = if sleep_duration < SELECT_THRESHOLD {
+        self.current_timestamp.store(min_next_ts.unwrap_or(usize::MAX), Ordering::SeqCst /*XXX*/);
         std::thread::sleep(sleep_duration);
         self.transmit(&mut dither_rng, process_events);
         if process_events {
@@ -202,6 +206,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           Command::NoOp
         }
       } else {
+        self.current_timestamp.store(usize::MAX, Ordering::Release);
         process_events = true;
         select! {
           recv_opt = self.commands_receiver.recv() => {
@@ -281,7 +286,7 @@ fn split_handle(h: FlowHandle) -> (u32, u16) {
 }
 
 impl FlowsTransmitter {
-  async fn run<P: ProxyToSamplesBuffer>(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
+  async fn run<P: ProxyToSamplesBuffer>(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, current_timestamp: Arc<AtomicUsize>) {
     let latency = latency_ns * sample_rate as usize / 1_000_000_000;
     let mut internal = FlowsTransmitterInternal {
       commands_receiver: rx,
@@ -289,8 +294,9 @@ impl FlowsTransmitter {
       flows: (0..MAX_FLOWS).map(|_|None).collect_vec(),
       clock: MediaClock::new(),
       channels_sources: channels_outputs,
-      send_latency_samples: latency,
+      send_latency_samples: latency, // TODO in ALSA plugin should be 0, the more the worse because aplay wants to fill the whole buffer
       timestamp_shift: 0isize.wrapping_sub_unsigned(latency),
+      current_timestamp,
       /* callback: Box::new(|mut timestamp: Clock, ch_index: usize, buffer: &mut [Sample]| {
         let period = 4 << ch_index;
         for sample in buffer {
@@ -302,7 +308,7 @@ impl FlowsTransmitter {
     };
     internal.run(start_time_rx).await;
   }
-  pub fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static>(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) -> (Self, JoinHandle<()>) {
+  pub fn start<P: ProxyToSamplesBuffer + Send + Sync + 'static>(self_info: Arc<DeviceInfo>, mut media_clock_receiver: broadcast::Receiver<ClockOverlay>, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, current_timestamp: Arc<AtomicUsize>) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
     tokio::spawn(async move {
@@ -310,7 +316,10 @@ impl FlowsTransmitter {
         let ovl_opt = media_clock_receiver.recv().await;
         match ovl_opt {
           Ok(overlay) => {
-            tx1.send(Command::UpdateClockOverlay(overlay)).await.log_and_forget();
+            match tx1.send(Command::UpdateClockOverlay(overlay)).await {
+              Ok(()) => {},
+              Err(_) => break
+            }
           },
           Err(broadcast::error::RecvError::Closed) => {
             break;
@@ -323,7 +332,7 @@ impl FlowsTransmitter {
     });
     let srate = self_info.sample_rate;
     // TODO dehardcode latency_ns
-    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 1_000_000, channels_outputs, start_time_rx).boxed_local());
+    let thread_join = run_future_in_new_thread("flows TX", move || Self::run(rx, srate, 0 /*TODO*/, channels_outputs, start_time_rx, current_timestamp).boxed_local());
     return (Self {
       commands_sender: tx,
       self_info: self_info.clone(),

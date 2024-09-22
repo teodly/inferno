@@ -100,7 +100,6 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                   remaining_samples: samples_count,
                 };
                 match sd.bytes_per_sample {
-                  // FIXME: in ALSA plugin timestamp should be shifted by channel latency into the future to avoid dropouts
                   // FIXME: in ALSA plugin there can be more than 1 sink per input channel because we skip SamplesCollector !!!
                   2 => ch.sink.write_from_at(ts, S16ReaderIterator(reader)),
                   3 => ch.sink.write_from_at(ts, S24ReaderIterator(reader)),
@@ -245,7 +244,10 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
       FlowsReceiverInternal { commands_receiver: rx, sockets: (0..MAX_FLOWS).map(|_|None).collect_vec(), poll, sample_rate, ref_instant };
     internal.run(start_time_rx);
   }
-  pub fn start(self_info: Arc<DeviceInfo>, ref_instant: Instant, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) -> (Self, JoinHandle<()>) {
+  pub fn start(self_info: Arc<DeviceInfo>, ref_instant: Instant, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, _current_timestamp: Arc<AtomicUsize>) -> (Self, JoinHandle<()>) {
+    // actually updating current_timestamp isn't necessarily needed
+    // because we always have receive latency so we don't have to be sample-accurate
+    // TODO: but it may increase stability in low-latency settings
     let (tx, rx) = mpsc::channel(100);
     let poll = mio::Poll::new().unwrap();
     let waker = mio::Waker::new(poll.registry(), WAKE_TOKEN).unwrap();

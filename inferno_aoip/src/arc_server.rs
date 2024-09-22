@@ -10,13 +10,14 @@ use bytebuffer::{ByteBuffer, Endian};
 use log::{error, info, trace};
 use std::{cmp::min, sync::Arc};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
+use tokio::sync::watch;
 
 pub async fn run_server(
   self_info: Arc<DeviceInfo>,
-  mut channels_recv_rx: tokio::sync::oneshot::Receiver<Arc<ChannelsSubscriber>>,
+  mut channels_sub_rx: watch::Receiver<Option<Arc<ChannelsSubscriber>>>,
   shutdown: BroadcastReceiver<()>,
 ) {
-  let mut channels_recv = None;
+  let mut subscriber = None;
   let server = UdpSocketWrapper::new(Some(self_info.ip_address), PORT, shutdown);
   let mut conn = req_resp::Connection::new(server);
   while conn.should_work() {
@@ -25,14 +26,8 @@ pub async fn run_server(
       None => continue,
     };
 
-    if channels_recv.is_none() {
-      match channels_recv_rx.try_recv() {
-        Ok(v) => {
-          channels_recv = Some(v);
-        },
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
-        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
-      }
+    if channels_sub_rx.has_changed().unwrap_or(false) {
+      subscriber = channels_sub_rx.borrow_and_update().clone();
     }
 
     if request.opcode2().read() == 0 {
@@ -157,7 +152,7 @@ pub async fn run_server(
           0x31, 0x00, 0x32, 0x00]);*/
           let content = request.content();
           let start_index = make_u16(content[2], content[3]) - 1;
-          let remaining = if channels_recv.is_some() { self_info.rx_channels.len().saturating_sub(start_index as usize) } else { 0 };
+          let remaining = if subscriber.is_some() { self_info.rx_channels.len().saturating_sub(start_index as usize) } else { 0 };
           let limit = 16;
           let in_this_response = min(limit, remaining);
           trace!("returning {in_this_response} rx channels starting with index {start_index}");
@@ -179,7 +174,7 @@ pub async fn run_server(
             response.write_u16((i + 1) as u16); // channel id
             response.write_u16(6); // ???
             response.write_u16(common_descr_offset as u16);
-            let status = channels_recv.as_ref().unwrap().channel_status(i);
+            let status = subscriber.as_ref().unwrap().channel_status(i);
             let (tx_ch_offset, tx_host_offset) = match &status {
               None => (0, 0),
               Some(status) => {
@@ -381,7 +376,7 @@ pub async fn run_server(
         0x3010 => {
           // subscribe (connect our receiver to remote transmitter)
           // or unsubscribe if tx_*_offset is 0
-          if let Some(channels_recv) = &channels_recv {
+          if let Some(channels_recv) = &subscriber {
             let c_whole = request.content();
             let count = c_whole[1] as usize;
             for i in 0..count {
