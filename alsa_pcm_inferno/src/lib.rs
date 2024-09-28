@@ -130,6 +130,8 @@ unsafe fn get_private<'a>(io: *mut snd_pcm_ioplug_t) -> &'a mut MyIOPlug {
 unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t {
     let this = get_private(io);
     let cur = this.current_timestamp.load(Ordering::SeqCst /*XXX*/);
+
+    // TODO may be non-monotonic in edge cases (switching between clocks)
     let ptr = if this.start_time.is_some() && (cur != usize::MAX) {
         //println!("using current_timestamp: {cur}");
         // It is important to use actual input/output clock here because sample precision is required.
@@ -152,14 +154,14 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         }
         now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
     };
-    // TODO may be non-monotonic in edge cases (switching between clocks)
-    let buffered = match (*io).stream {
-        SND_PCM_STREAM_CAPTURE => ptr.wrapping_sub((*io).appl_ptr as i64),
-        SND_PCM_STREAM_PLAYBACK => ((*io).appl_ptr as i64).wrapping_sub(ptr),
-        _ => 0
+    
+    let (dir, buffered) = match (*io).stream {
+        SND_PCM_STREAM_CAPTURE => ("capture", ptr.wrapping_sub((*io).appl_ptr as i64)),
+        SND_PCM_STREAM_PLAYBACK => ("playback", ((*io).appl_ptr as i64).wrapping_sub(ptr)),
+        _ => ("???", 0)
     };
     if buffered < 0 {
-        println!("buffered: {buffered} samples");
+        println!("buffered for {dir}: {buffered} samples");
     }
     ptr
 }

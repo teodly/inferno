@@ -32,7 +32,7 @@ pub const MAX_LAG_SAMPLES: usize = 4800;
 pub const DISCONTINUITY_THRESHOLD_SAMPLES: usize = 192000;
 const BUFFERED_SAMPLES_PER_CHANNEL: usize = 65536;
 pub const SELECT_THRESHOLD: Duration = Duration::from_millis(100);
-pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles
+pub const MIN_SLEEP: Duration = Duration::from_millis(0); // to save CPU cycles, TODO: make it configurable via some "eco mode" flag
 
 pub type SamplesRequestCallback = Box<dyn FnMut(Clock, usize, &mut [Sample]) + Send + 'static>;
 

@@ -259,6 +259,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
   }
   pub async fn shutdown(&self) {
     self.commands_sender.send(Command::Shutdown).await.log_and_forget();
+    self.waker.wake().log_and_forget();
   }
   pub async fn add_socket(
     &self,
