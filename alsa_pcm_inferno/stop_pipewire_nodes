@@ -1,0 +1,5 @@
+#!/bin/bash
+
+pw-dump | jq '.[] | select(.info.props."api.alsa.path" | test("inferno:?.*")?) | .id' | while read id; do
+    pw-cli destroy $id
+done

@@ -1,0 +1,2 @@
+#!/bin/bash
+pw-cli create-node adapter '{ object.linger=1 factory.name=api.alsa.pcm.sink node.name="Inferno sink" media.class=Audio/Sink api.alsa.path=inferno session.suspend-timeout-seconds=0 node.pause-on-idle=false node.suspend-on-idle=false node.always-process=true }'
