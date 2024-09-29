@@ -6,7 +6,7 @@ use futures_util::FutureExt;
 use inferno_aoip::utils::{run_future_in_new_thread, LogAndForget};
 use inferno_aoip::{AtomicSample, DeviceInfo, DeviceServer, ExternalBufferParameters, MediaClock, RealTimeClockReceiver, Sample, SelfInfoBuilder};
 use lazy_static::lazy_static;
-use libc::{c_char, c_int, c_uint, c_void, free, malloc, EBUSY};
+use libc::{c_char, c_int, c_uint, c_void, eventfd, free, malloc, EBUSY, EFD_CLOEXEC, EPIPE, POLLIN};
 use tokio::sync::{mpsc, oneshot};
 use std::borrow::BorrowMut;
 use std::collections::VecDeque;
@@ -15,8 +15,8 @@ use std::ptr::{null_mut, null};
 use std::mem::zeroed;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
-use std::time::Instant;
+use std::thread::{sleep, JoinHandle};
+use std::time::{Duration, Instant};
 
 
 enum Command {
@@ -148,11 +148,17 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
             }
         }
         let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
-        if now_samples_opt.is_some() && this.start_time.is_none() {
+        /* if now_samples_opt.is_some() && this.start_time.is_none() {
+            println!("warning: setting start_time in plugin_pointer, not plugin_start");
             this.start_time = now_samples_opt;
             this.start_time_tx.take().unwrap().send(now_samples_opt.unwrap()).expect("failed to send start timestamp");
+        } */
+        if now_samples_opt.is_some() && this.start_time.is_some() {
+            now_samples_opt.unwrap().wrapping_sub(this.start_time.unwrap()) as i64
+        } else {
+            0
         }
-        now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
+        //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
     };
     
     let (dir, buffered) = match (*io).stream {
@@ -160,8 +166,15 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         SND_PCM_STREAM_PLAYBACK => ("playback", ((*io).appl_ptr as i64).wrapping_sub(ptr)),
         _ => ("???", 0)
     };
-    if buffered < 0 {
-        println!("buffered for {dir}: {buffered} samples");
+
+    if buffered < 0 && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING) {
+        let ioplug_avail = snd_pcm_ioplug_avail(io, ptr as u64, (*io).appl_ptr);
+        let ioplug_hw_avail = snd_pcm_ioplug_hw_avail(io, ptr as u64, (*io).appl_ptr);
+        println!("buffered for {dir}: {buffered} samples, avail {ioplug_avail}, hw_avail {ioplug_hw_avail}");
+        
+        return (-EPIPE) as i64; // report xrun
+        // TODO check for xruns in ExternalRingBuffer because this function may be called too seldom
+        // FIXME we're restarting the whole transmitter/receiver on xrun which results in a LONG break, unacceptable!
     }
     ptr
 }
@@ -218,6 +231,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     this.stream_info = Some(StreamInfo {
         boundary: boundary as usize // TODO use this
     });
+    this.start_time = None;
 
     let (start_time_tx, start_time_rx) = oneshot::channel::<usize>();
     let (clock_tx, clock_rx) = oneshot::channel::<RealTimeClockReceiver>();
@@ -251,6 +265,11 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
 
     this.clock_receiver = Some(clock_rx.blocking_recv().expect("no clocks available"));
     this.start_time_tx = Some(start_time_tx);
+    if let Some(clock_receiver) = &mut this.clock_receiver {
+        if let Some(overlay) = clock_receiver.get() {
+            this.media_clock.update_overlay(*overlay);
+        }
+    }
     *this.buffers_valid.write().unwrap() = true;
 
     0
@@ -329,6 +348,8 @@ unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
 unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_char, root: *const snd_config_t, conf: *const snd_config_t, stream: snd_pcm_stream_t, mode: c_int) -> c_int {
     let app_name = get_app_name().unwrap_or(std::process::id().to_string());
 
+    let efd = eventfd(0, EFD_CLOEXEC);
+
     let myio = Box::into_raw(Box::new(MyIOPlug {
         io: zeroed(),
         callbacks: snd_pcm_ioplug_callback_t {
@@ -356,6 +377,8 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
     io.name = PLUGIN_NAME.as_ptr() as *const _;
     io.callback = &(*myio).callbacks;
     io.mmap_rw = 1;
+    io.poll_events = POLLIN as u32;
+    io.poll_fd = efd;
     io.private_data = myio as *mut _;
 
     let r = snd_pcm_ioplug_create(io, name, stream, mode);
@@ -367,7 +390,11 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
     if r < 0 {
         panic!("snd_pcm_ioplug_set_param_list SND_PCM_IOPLUG_HW_FORMAT returned {r}");
     }
-    //snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_ACCESS as i32, 2, [SND_PCM_ACCESS_MMAP_INTERLEAVED as u32, SND_PCM_ACCESS_MMAP_NONINTERLEAVED as u32].as_ptr());
+
+    let r = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_ACCESS as i32, 2, [SND_PCM_ACCESS_MMAP_INTERLEAVED as u32, SND_PCM_ACCESS_RW_INTERLEAVED as u32].as_ptr()); // FIXME investigate why planar doesn't work
+    if r < 0 {
+        panic!("snd_pcm_ioplug_set_param_list SND_PCM_IOPLUG_HW_ACCESS returned {r}");
+    }
 
     let r = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_RATE as i32, 1, [(*myio).self_info.sample_rate].as_ptr());
     if r < 0 {
@@ -387,6 +414,15 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
 
     *pcmp = (*myio).io.pcm;
 
+    // XXX just a PoC
+    // necessary to wake misbehaving processes often enough (e.g. sox)
+    // FIXME do it properly
+    std::thread::spawn(move || {
+        loop {
+            libc::write(efd, [1u64].as_ptr() as *const c_void, 8);
+            sleep(Duration::from_millis(10));
+        }
+    });
     println!("plugin_define end");
     0
 }

@@ -40,6 +40,9 @@ impl MediaClock {
   pub fn is_ready(&self) -> bool {
     self.overlay.is_some()
   }
+  pub fn get_overlay(&self) -> &Option<ClockOverlay> {
+    &self.overlay
+  }
   pub fn update_overlay(&mut self, mut overlay: ClockOverlay) {
     overlay.shift = overlay.shift.wrapping_add(CLOCK_OFFSET_NS as i64);
     if let Some(cur_overlay) = self.overlay {
@@ -83,9 +86,24 @@ pub fn start_clock_receiver() -> ClockReceiver {
   ClockReceiver::start(usrvclock::DEFAULT_SERVER_SOCKET_PATH.into(), Box::new(|e| warn!("clock receive error: {e:?}")))
 }
 
-pub fn make_shared_media_clock(receiver: &ClockReceiver) -> Arc<RwLock<MediaClock>> {
+pub async fn make_shared_media_clock(receiver: &ClockReceiver) -> Arc<RwLock<MediaClock>> {
   let mut rx = receiver.subscribe();
-  let media_clock = Arc::new(RwLock::new(MediaClock::new()));
+  let mut media_clock = MediaClock::new();
+  loop {
+    match rx.recv().await {
+      Ok(overlay) => {
+        media_clock.update_overlay(overlay);
+        break;
+      }
+      Err(broadcast::error::RecvError::Closed) => {
+        panic!("ClockReceiver channel closed during initial await");
+      },
+      Err(e) => {
+        warn!("clock receive error {e:?}");
+      }
+    }
+  }
+  let media_clock = Arc::new(RwLock::new(media_clock));
   let media_clock1 = media_clock.clone();
   tokio::spawn(async move {
     loop {
@@ -105,8 +123,8 @@ pub fn make_shared_media_clock(receiver: &ClockReceiver) -> Arc<RwLock<MediaCloc
   media_clock1
 }
 
-pub fn async_clock_receiver_to_realtime(mut receiver: broadcast::Receiver<ClockOverlay>) -> RealTimeBoxReceiver<Option<ClockOverlay>> {
-  let (rt_sender, rt_recv) = real_time_box_channel::channel(Box::new(None));
+pub fn async_clock_receiver_to_realtime(mut receiver: broadcast::Receiver<ClockOverlay>, initial: Option<ClockOverlay>) -> RealTimeBoxReceiver<Option<ClockOverlay>> {
+  let (rt_sender, rt_recv) = real_time_box_channel::channel(Box::new(initial));
   tokio::spawn(async move {
     loop {
       let ovl_opt = receiver.recv().await;

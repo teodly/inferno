@@ -34,6 +34,7 @@ impl<T> ProxyToBuffer<T> for OwnedBuffer<T> {
   fn map<R>(&self, cb: impl FnOnce(&[T]) -> R) -> Option<R> {
     Some(cb(self.0.as_slice()))
   }
+  #[inline(always)]
   fn unconditional_read(&self) -> bool {
     false
   }
@@ -70,9 +71,11 @@ impl<T> ExternalBuffer<T> {
 }
 
 impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
+  #[inline(always)]
   fn len(&self) -> usize {
       self.length
   }
+  #[inline(always)]
   fn map<R>(&self, cb: impl FnOnce(&[T]) -> R) -> Option<R> {
     if let Ok(guard) = self.valid.try_read() {
       let valid = *guard;
@@ -85,6 +88,7 @@ impl<T> ProxyToBuffer<T> for ExternalBuffer<T> {
       None
     }
   }
+  #[inline(always)]
   fn unconditional_read(&self) -> bool {
     true
   }

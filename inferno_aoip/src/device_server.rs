@@ -133,7 +133,8 @@ impl DeviceServer {
     let clock_receiver = start_clock_receiver();
 
     info!("waiting for clock");
-    clock_receiver.subscribe().recv().await.unwrap();
+    // MAYBE TODO refactor to tokio::sync::watch
+    let shared_media_clock = make_shared_media_clock(&clock_receiver).await;
     info!("clock ready");
 
     let mut tasks = vec![];
@@ -160,7 +161,6 @@ impl DeviceServer {
       }
     }.boxed();
 
-    let shared_media_clock = make_shared_media_clock(&clock_receiver);
     Self {
       self_info,
       ref_instant,
@@ -185,7 +185,7 @@ impl DeviceServer {
     self.receive(tasks, None, buffering, Default::default()).await;
   }
   pub async fn receive_realtime(&mut self) -> RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>> {
-    let (col, col_fut, rt_recv) = SamplesCollector::new_realtime(self.self_info.clone(), self.clock_receiver.subscribe());
+    let (col, col_fut, rt_recv) = SamplesCollector::new_realtime(self.self_info.clone(), self.get_realtime_clock_receiver());
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
     self.receive(tasks, None, buffering, Default::default()).await;
@@ -251,7 +251,7 @@ impl DeviceServer {
 
 
   pub fn get_realtime_clock_receiver(&self) -> RealTimeClockReceiver {
-    async_clock_receiver_to_realtime(self.clock_receiver.subscribe())
+    async_clock_receiver_to_realtime(self.clock_receiver.subscribe(), self.shared_media_clock.read().unwrap().get_overlay().clone())
   }
 
   /* pub fn take_tx_inputs(&mut self) -> Vec<RBInput<Sample, P>> {

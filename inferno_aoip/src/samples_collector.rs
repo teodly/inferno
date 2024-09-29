@@ -307,7 +307,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
     return (Self { commands_sender: tx }, async move { internal.run().await }.boxed());
   }
 
-  pub fn new_realtime(self_info: Arc<DeviceInfo>, media_clock_receiver: broadcast::Receiver<ClockOverlay>) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>, RealTimeSamplesReceiver<P>) {
+  pub fn new_realtime(self_info: Arc<DeviceInfo>, clock_recv: RealTimeBoxReceiver<Option<ClockOverlay>>) -> (Self, Pin<Box<dyn Future<Output = ()> + Send + 'static>>, RealTimeSamplesReceiver<P>) {
     let (tx, rx) = mpsc::channel(100);
     let (senders, receivers) = (0..self_info.rx_channels.len()).map(|chi| {
       real_time_box_channel::channel(Box::new(None))
@@ -321,7 +321,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static> SamplesCollector<P> {
     (Self {commands_sender: tx}, async move { internal.run().await }.boxed(), RealTimeSamplesReceiver {
       channels: receivers,
       clock: MediaClock::new(),
-      clock_recv: async_clock_receiver_to_realtime(media_clock_receiver)
+      clock_recv
     })
   }
 

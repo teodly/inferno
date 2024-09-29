@@ -1,10 +1,18 @@
-pcm.!default {
+pcm.inferno {
 	type inferno
 	#card 0
 }
 
-ctl.!default {
-	type inferno
-	#card 0
-}
+#ctl.inferno {
+#	type inferno
+#	#card 0
+#}
 
+#pcm.inferno_plug {
+#	type plug
+#	slave {
+#		pcm {
+#			type inferno
+#		}
+#	}	
+#}
