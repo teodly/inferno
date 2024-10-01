@@ -4,6 +4,8 @@ Highly experimental for now. I don't recommend using it for serious purposes.
 
 However, chances that it'll break already working Dante network are low.
 
+Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trifecta Tech Foundation](https://trifectatech.org/)) for creating and maintaining [Statime](https://github.com/pendulum-project/statime) and collaboration on features needed for audiovisual networks functionality! Audio transmission would be much more difficult to implement without it.
+
 # Features
 * receiving audio from and sending audio to Dante devices and virtual devices
 * connections can be made using Dante Controller or [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) (`netaudio` command line tool)
@@ -15,26 +17,32 @@ However, chances that it'll break already working Dante network are low.
 | Maturity | 💣 Alpha | ✅ Production-ready | ✅ Probably stable |
 | Platforms | Linux  | Mac, Windows  | Linux |
 | Supported protocols | Dante | Dante | AES67 |
-| Works with DAWs | 💣 try PipeWire plugin if you're brave | ✅ Yes | ✅ Yes |
+| Directly supported audio backends | ALSA, PipeWire | CoreAudio, ASIO, WDM | ALSA |
+| Works with DAWs | 💣 experimental, with PipeWire | ✅ Yes | ✅ Yes |
 | Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
 | Configurable using Dante Controller | ⏳ Mostly not yet | ✅ Yes | 🚫 No |
 | Compatible with Dante Domain Manager | 🚫 No | ✅ Yes | 🚫 No (but AES67 integration possible) |
-| Supported clock protocols | PTPv2 ✅, [experimental PTPv1](https://github.com/teodly/statime/tree/ptpv1-hack) 💣 | PTPv1 ✅ | PTPv2 ✅ |
-| Clock leader | PTPv2 ✅ via [Statime](https://github.com/pendulum-project/statime) | 🚫 No (but possible in Dante Via) | ✅ via external daemon |
+| Supported clock protocols | PTPv2 ☑️, ⏳ [PTPv1](https://github.com/teodly/statime/tree/ptpv1-hack) soon 💣 | PTPv1 ✅ | PTPv2 ✅ |
+| Clock leader | PTPv2 ☑️ via [Statime](https://github.com/pendulum-project/statime) | 🚫 No (but possible in Dante Via) | ☑️ via external daemon |
 | Stream audio from/to modern Dante hardware | ✅ Yes | ✅ Yes | ✅ Yes |
-| Stream audio from/to DVS & Dante Via | ✅ Yes | ✅ Yes | 🚫 No  |
+| Stream audio from/to DVS, Dante Via & old Dante hardware | ✅ Yes | ✅ Yes | 🚫 No  |
 | Stream audio from/to AES67           | 🚫 No  | 🚫 No  | ✅ Yes |
+| Minimum latency | as low as your kernel gets | 4ms | ... | 
 | Sends & receives multicasts | ⏳ Not yet | ✅ Yes | ✅ Yes |
 | OS integration | Entirely user-space | Kernel driver & user-space services | Kernel driver & user-space helper |
-| Supported audio backends | ALSA, PipeWire | CoreAudio, ASIO, WDM | ALSA |
-| Lightweight recording app | ✅ Yes (Inferno2pipe) | 🚫 No | ✅ FFmpeg with RTP input does the trick |
+| Lightweight recording app | ✅ Yes (Inferno2pipe) | 🚫 No | ☑️ FFmpeg with RTP input does the trick |
 | Disk space & RAM usage | 🌱 Low (~12MB RAM) | 🔥 High | 🌱 Low |
 | Written in | Rust | C++, Java | C++, C |
 | License | 🥰 FOSS, copyleft | 🔒 Closed source | 🥰 FOSS, copyleft |
-| [DRM](https://drm.info/what-is-drm.en.html) | ✅ No | 🔒 Actiation required, virtual machines banned | ✅ No |
+| [DRM](https://drm.info/what-is-drm.en.html) | 😊 No | 🔒 Actiation required, virtual machines banned | 😊 No |
 | Price   | Free of charge | 🤑 50-80 USD ... *for a **device driver*** | Free of charge |
 | Privacy | 😊 No tracking | 😡 Registration required, telemetry enabled by default | 😊 No tracking |
 
+* ✅ - usable
+* 💣 - experimental
+* ☑️ - not a part of this software but integration is easily possible
+* ⏳ - will be implemented soon (in 2024 probably)
+* 🚫 - unimplemented and not planned for the near future
 
 ## Quirks, read it before using:
 * Dante protocol is undocumented. Everything was reverse-engineered or based on other reverse-engineering projects. Some things in implementation were guessed. So while it works with my setup, it may not work with yours.
@@ -50,13 +58,20 @@ Disclaimer: Dante uses technology patented by Audinate. This source code may use
 This project makes no claim to be either authorized or approved by Audinate.
 
 
-# Quick start - how to record audio?
-1. [install Rust](https://rustup.rs/) and [FFmpeg](http://ffmpeg.org/)
-2. clone this repo with `--recursive` option (some dependencies are in submodules)
-3. `cd inferno2pipe`
-4. `./save_to_file 4` where `4` is number of channels
-   * if your Dante network operates with sample rate other that 48000Hz, prefix the command with e.g. `sample_rate=44100`
-5. make connections using [network-audio-controller](https://github.com/chris-ritsen/network-audio-controller) or Dante Controller
+# Quick start
+1. [Install Rust](https://rustup.rs/)
+2. If wanting to use anything other than Inferno2pipe, clock synchronization daemon is needed. Inferno is compatible with modified [Statime](https://github.com/pendulum-project/statime):
+   * Enable AES67 in at least 1 device in the network. Otherwise Statime which is PTPv2-only won't be able to get timestamps from PTPv1 used by Dante. It will be fixed soon - [a workaround exists](https://github.com/teodly/statime/tree/ptpv1-hack) but wasn't merged yet with other changes.
+   * `git clone -b inferno-dev https://github.com/teodly/statime`
+   * `cd statime && cargo build`
+   * `sudo target/debug/statime -c inferno-ptpv2.toml`
+3. Clone this repo with `--recursive` option (some dependencies are in submodules)
+4. `cd` to the desired program/library directory
+   * simple command line audio recorder: [`Inferno2pipe`](inferno2pipe/README.md)
+   * virtual soundcard for ALSA: [`alsa_pcm_inferno`](alsa_pcm_inferno/README.md) - also works with PipeWire, should work with JACK (not tested yet)
+   * virtual soundcard for PipeWire: `inferno_wired`
+5. `cargo build`
+6. Follow the instructions in README of the specific program/library
 
 
 # Tested with
@@ -101,12 +116,17 @@ Please use editor respecting `.editorconfig` (for example, VSCode needs an exten
 
 
 # Changelog
+
+## 0.3.0
+* introduced ALSA PCM plugin - a virtual soundcard compatible with most Linux audio apps
+* receive clock using a documented protocol: [usrvclock](https://gitlab.com/lumifaza/usrvclock)
+* various internal changes primarily related to allowing the use of external buffers (needed for mmap mode in ALSA plugin)
+
 ## 0.2.0
 * audio transmitter
 * alpha version of Inferno Wired - virtual audio source & sink for PipeWire
 * receiving clock from [Statime](https://github.com/teowoz/statime) modified for PTPv1 and virtual clock support - Linux-only for now (because CLOCK_TAI is Linux-only)
 * increased receive thread priority to reduce chance of OS UDP input queue overflow
-
 
 ## 0.1.0
 

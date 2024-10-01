@@ -949,7 +949,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4979f22fdb869068da03c9f7528f8297c6fd2606bc3a4affe42e6a823fdb8da4"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -1862,8 +1862,8 @@ dependencies = [
 
 [[package]]
 name = "usrvclock"
-version = "0.1.0"
-source = "git+https://gitlab.com/lumifaza/usrvclock-rs#4bd7b0455d20e87f40edecc75862cdc07a52aae3"
+version = "0.1.1"
+source = "git+https://gitlab.com/lumifaza/usrvclock-rs#24da792ee30d69d696ad36f1599787090688c9d9"
 dependencies = [
  "custom_error",
  "nix 0.29.0",
