@@ -9,7 +9,7 @@ use tokio::{sync::{broadcast, mpsc}, time::interval};
 const READ_INTERVAL: Duration = Duration::from_millis(50);
 const BUFFER_SIZE: usize = 65536;
 const SANE_CLOCK_DIFF: usize = 192000;
-const MAX_LAG_SAMPLES: usize = 9600;
+const MAX_LAG_SAMPLES: Clock = 9600;
 
 pub type SamplesCallback = Box<dyn FnMut(usize, &Vec<Vec<Sample>>) + Send + 'static>;
 
@@ -38,7 +38,7 @@ impl<P: ProxyToSamplesBuffer> Channel<P> {
     }
 
     // read samples:
-    let r = self.source.read_at(start_timestamp, buffer);
+    let r = self.source.read_at(start_timestamp as usize, buffer);
     if r.useful_start_index != 0 {
       if self.was_connected {
         self.report_lost_samples(start_timestamp, r.useful_start_index, "buffer underrun or overwritten in the meantime");
@@ -54,7 +54,7 @@ impl<P: ProxyToSamplesBuffer> Channel<P> {
     }
     if r.useful_end_index != buffer.len() {
       if self.was_connected {
-        self.report_lost_samples( start_timestamp.wrapping_add(r.useful_end_index), buffer.len()-r.useful_end_index, "buffer underrun");
+        self.report_lost_samples( start_timestamp.wrapping_add(r.useful_end_index.try_into().unwrap()), buffer.len()-r.useful_end_index, "buffer underrun");
         good = false;
       }
       for sample in &mut buffer[r.useful_end_index..] {
@@ -62,7 +62,7 @@ impl<P: ProxyToSamplesBuffer> Channel<P> {
       }
     }
     if !good {
-      warn!("wanted {start_timestamp}..{} but has ..{}", start_timestamp + buffer.len(), self.source.readable_until());
+      warn!("wanted {start_timestamp}..{} but has ..{}", start_timestamp + buffer.len() as u64, self.source.readable_until());
     }
     good
   }
@@ -88,13 +88,13 @@ impl<P: ProxyToSamplesBuffer> RealTimeSamplesReceiver<P> {
       } else {
         0
       }
-    }).unwrap_or(0)
+    }).unwrap_or(0).try_into().unwrap()
   }
   pub fn get_samples(&mut self, start_timestamp: Clock, channel_index: usize, buffer: &mut [Sample]) -> bool {
     let chrecv = &mut self.channels[channel_index];
     chrecv.update();
     if let Some(ch) = chrecv.get_mut() {
-      let start_timestamp = start_timestamp.wrapping_sub(ch.latency_samples).wrapping_sub(buffer.len());
+      let start_timestamp = start_timestamp.wrapping_sub(ch.latency_samples).wrapping_sub(buffer.len() as Clock);
       ch.read_samples_from_ringbuffer(start_timestamp, buffer)
     } else {
       buffer.fill(0);
@@ -145,7 +145,7 @@ impl<P: ProxyToSamplesBuffer> ToRealTime<P> {
           id: channel_index+1,
           source,
           prev_holes_count: 0,
-          latency_samples,
+          latency_samples: latency_samples.try_into().unwrap(),
           was_connected: false
         })));
       }
@@ -177,8 +177,9 @@ fn get_min_max_end_timestamps<'a, P: ProxyToSamplesBuffer + 'a>(channels: impl I
     .map(|ch| ch.source.readable_until())
     .collect_vec();
   Some((
-    clocks.iter().min_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?.to_owned(),
-    clocks.iter().max_by(|&&a, &&b| wrapped_diff(a, b).cmp(&0))?.to_owned()
+    clocks.iter().min_by(|&&a, &&b| wrapped_diff(a as Clock, b as Clock).cmp(&0))?.to_owned().try_into().unwrap(),
+    clocks.iter().max_by(|&&a, &&b| wrapped_diff(a as Clock, b as Clock).cmp(&0))?.to_owned().try_into().unwrap()
+    // XXX FIXME wrapping not handled correctly when sizeof(Clock) > sizeof(usize)
   ))
 }
 
@@ -208,7 +209,7 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
               if let Some(mut start_timestamp) = clock {
                 // we already have clock, use it as a start timestamp
 
-                let mut readable_samples_count = readable_until.wrapping_sub(start_timestamp);
+                let mut readable_samples_count = readable_until.wrapping_sub(start_timestamp).try_into().unwrap();
                 if readable_samples_count == 0 {
                   warn!("no new samples?!");
                 } else {
@@ -217,10 +218,10 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
                 if readable_samples_count > SANE_CLOCK_DIFF {
                   error!("insane clock diff {readable_samples_count}, using {SANE_CLOCK_DIFF} last samples");
                   readable_samples_count = SANE_CLOCK_DIFF;
-                  start_timestamp = readable_until.wrapping_sub(readable_samples_count);
+                  start_timestamp = readable_until.wrapping_sub(readable_samples_count.try_into().unwrap());
                 }
-                if readable_samples_count > BUFFER_SIZE {
-                  readable_samples_count = BUFFER_SIZE;
+                if readable_samples_count > BUFFER_SIZE.try_into().unwrap() {
+                  readable_samples_count = BUFFER_SIZE.try_into().unwrap();
                 }
                 for chi in 0..self.channels.len() {
                   let mut buffer = channels_buffers[chi].as_mut_slice();
@@ -230,7 +231,8 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
                       // or lag prevention logic triggers,
                       // it would break our assumption that each channel has *at least* readable_samples_count readable.
                       // that's why we need this check.
-                      if wrapped_diff(ch.source.readable_until(), readable_until) < 0 {
+                      // XXX FIXME wrapping
+                      if wrapped_diff(ch.source.readable_until() as u64, readable_until as u64) < 0 {
                         None
                       } else {
                         Some(ch)
@@ -246,7 +248,7 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
                   }
                 }
                 (self.callback)(readable_samples_count, &channels_buffers);
-                start_timestamp.wrapping_add(readable_samples_count)
+                start_timestamp.wrapping_add(readable_samples_count.try_into().unwrap())
               } else {
                 // we don't have clock yet, bootstrap it using currently available timestamp
                 readable_until
@@ -254,7 +256,7 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
             };
             for chi in 0..self.channels.len() {
               if let Some(ch) = &mut self.channels[chi] {
-                ch.source.read_done(new_clock);
+                ch.source.read_done(new_clock as usize); // TODO force buffer sizes to be power of 2
               }
             }
             clock = Some(new_clock);
@@ -273,7 +275,7 @@ impl<P: ProxyToSamplesBuffer> PeriodicSamplesCollector<P> {
     match command {
       Command::ConnectChannel{channel_index, source, latency_samples } => {
         debug!("connecting channel index={channel_index}");
-        self.channels[channel_index] = Some(Channel { id: channel_index+1, source, prev_holes_count: 0, latency_samples, was_connected: false });
+        self.channels[channel_index] = Some(Channel { id: channel_index+1, source, prev_holes_count: 0, latency_samples: latency_samples.try_into().unwrap(), was_connected: false });
       }
       Command::DisconnectChannel{channel_index} => {
         debug!("disconnecting channel index={channel_index}");

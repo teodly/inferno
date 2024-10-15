@@ -5,6 +5,11 @@ use bool_vec::{boolvec, BoolVec};
 use bytemuck::NoUninit;
 use itertools::Itertools;
 
+pub fn wrapsub(a: usize, b: usize) -> isize {
+  (a as isize).wrapping_sub(b as isize)
+}
+
+
 pub trait ProxyToBuffer<T> {
   fn len(&self) -> usize;
   /// If buffer is available, executes `cb` with buffer's slice as an argument and returns Some with its result
@@ -109,7 +114,7 @@ struct RingBufferShared<T, P: ProxyToBuffer<Atomic<T>>> {
 }
 
 impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
-  fn new(storage: P, stride: usize, start_time: Clock) -> Arc<Self> {
+  fn new(storage: P, stride: usize, start_time: usize) -> Arc<Self> {
     let items_size = (storage.len()+stride-1) / stride;
     Arc::new(RingBufferShared {
       _t: Default::default(),
@@ -122,7 +127,7 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> RingBufferShared<T, P> {
       holes_count: 0.into()
     })
   }
-  fn item_to_buffer_index(&self, i: Clock) -> Clock {
+  fn item_to_buffer_index(&self, i: usize) -> usize {
     // TODO change to more optimized log2 implementation when we're sure that buffer length will always be power of 2
     (i % self.items_size) * self.stride
   }
@@ -156,10 +161,10 @@ pub struct RBInput<T, P: ProxyToBuffer<Atomic<T>>> {
 }
 
 impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
-  pub fn write_from_at(&mut self, start_timestamp: Clock, mut input: impl ExactSizeIterator<Item = T>) {
+  pub fn write_from_at(&mut self, start_timestamp: usize, mut input: impl ExactSizeIterator<Item = T>) {
     let input_len = input.len();
     assert!(input_len < self.rb.items_size);
-    let hole = wrapped_diff(start_timestamp, self.rb.writing_pos.load(Ordering::Relaxed)) > 0;
+    let hole = wrapsub(start_timestamp, self.rb.writing_pos.load(Ordering::Relaxed)) > 0;
     //let wrapped_start_ts = start_timestamp % self.rb.items_size;
     if hole {
       //let wrapped_writing_pos = self.rb.writing_pos.load(Ordering::Relaxed) % self.rb.items_size;
@@ -175,7 +180,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     self.rb.buffer.map(|buffer| {
       let mut hole_in_past = self.rb.readable_pos.load(Ordering::Relaxed) != self.rb.writing_pos.load(Ordering::Relaxed);
 
-      if wrapped_diff(end_ts, self.rb.writing_pos.load(Ordering::Relaxed)) > 0 {
+      if wrapsub(end_ts, self.rb.writing_pos.load(Ordering::Relaxed)) > 0 {
         self.rb.writing_pos.store(end_ts, Ordering::Release);
       }
       for_in_ring(self.rb.items_size, start_timestamp, end_ts, |i| {
@@ -215,7 +220,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
         self.rb.readable_pos.store(new_write_pos, Ordering::Release);
       }
       let new_writing_pos = start_timestamp.wrapping_add(input_len);
-      if wrapped_diff(new_writing_pos, self.rb.writing_pos.load(Ordering::Relaxed) /* really? */) > 0 {
+      if wrapsub(new_writing_pos, self.rb.writing_pos.load(Ordering::Relaxed) /* really? */) > 0 {
         self.rb.writing_pos.store(new_writing_pos, Ordering::Release);
       }
       if !(hole || hole_in_past) {
@@ -249,18 +254,18 @@ impl<T, P: ProxyToBuffer<Atomic<T>>> Clone for RBOutput<T, P> {
 }
 
 impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
-  pub fn readable_until(&self) -> Clock {
+  pub fn readable_until(&self) -> usize {
     self.rb.readable_pos.load(Ordering::Acquire)
   }
   /// Because single ring buffer with its read position pointer can be shared between multiple `RBOutput`s,
   /// this method, unlike `RBInput::write_from_at`, does not advance the read position.
   /// Use the method `read_done` when reads of all `RBOutput`s sharing the same ring buffer are done.
-  pub fn read_at(&self, start_timestamp: Clock, output: &mut [T]) -> ReadResult {
+  pub fn read_at(&self, start_timestamp: usize, output: &mut [T]) -> ReadResult {
     // in normal case: start_ts < readable_pos <= writing_pos
     let output_len = if self.rb.buffer.unconditional_read() {
       output.len()
     } else {
-      let readable = wrapped_diff(self.rb.readable_pos.load(Ordering::Acquire), start_timestamp);
+      let readable = wrapsub(self.rb.readable_pos.load(Ordering::Acquire), start_timestamp);
       if readable < 0 || readable > self.rb.items_size.try_into().unwrap() {
         debug!("readable {readable}, items_size {}", self.rb.items_size);
         // we're trying to read not yet written data, or we're lagging behind so much that data at that timestamp has already been overwritten
@@ -288,7 +293,7 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
 
     if !self.rb.buffer.unconditional_read() {
       let writing_pos = self.rb.writing_pos.load(Ordering::Acquire);
-      let diff = wrapped_diff(writing_pos, start_timestamp);
+      let diff = wrapsub(writing_pos, start_timestamp);
       if diff > self.rb.items_size.try_into().unwrap() {
         // data has been overwritten in the meantime, so some data at the beginning of the buffer may be wrong
         let overwritten = diff as usize - self.rb.items_size;
@@ -299,7 +304,7 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
     ReadResult { useful_start_index: 0, useful_end_index: output_len }
   }
 
-  pub fn read_done(&self, until: Clock) {
+  pub fn read_done(&self, until: usize) {
     self.rb.read_pos.store(until, Ordering::Release);
   }
   pub fn holes_count(&self) -> usize {
@@ -307,7 +312,7 @@ impl<T: NoUninit, P: ProxyToBuffer<Atomic<T>>> RBOutput<T, P> {
   }
 }
 
-pub fn new_owned<T: Default>(length: usize, start_time: Clock, hole_fix_wait: usize) -> (RBInput<T, OwnedBuffer<Atomic<T>>>, RBOutput<T, OwnedBuffer<Atomic<T>>>) {
+pub fn new_owned<T: Default>(length: usize, start_time: usize, hole_fix_wait: usize) -> (RBInput<T, OwnedBuffer<Atomic<T>>>, RBOutput<T, OwnedBuffer<Atomic<T>>>) {
   let shared = RingBufferShared::new(OwnedBuffer::<Atomic<T>>::new(length), 1, start_time);
   (
     RBInput{ rb: shared.clone(), item_ready: boolvec![false; shared.items_size], hole_fix_wait },
@@ -321,11 +326,11 @@ pub struct ExternalRBInput<T> {
 }
 
 impl<T> ExternalRBInput<T> {
-  fn advance(&self, new_position: Clock) {
+  fn advance(&self, new_position: usize) {
     self.rb.writing_pos.store(new_position, Ordering::Release);
     self.rb.readable_pos.store(new_position.wrapping_sub(self.margin), Ordering::Release);
   }
-  fn position(&self, clock: Clock) -> Clock {
+  fn position(&self, clock: usize) -> usize {
     clock
   }
 }
@@ -335,7 +340,7 @@ pub struct ExternalRBOutput<T> {
 }
 
 impl<T> ExternalRBOutput<T> {
-  fn position(&self, _clock: Clock) -> Clock {
+  fn position(&self, _clock: usize) -> usize {
     self.rb.readable_pos.load(Ordering::Acquire)
     // TODO when no data is received and so readable_pos can't be advanced by normal means, fill with silence
   }
@@ -363,13 +368,13 @@ impl<T> ExternalBufferParameters<T> {
 
 
 // safety: ExternalBufferParameters::new is unsafe so user acknowledges the dangers when creating the `par` struct
-pub fn wrap_external_source<T: Default>(par: &ExternalBufferParameters<T>, start_time: Clock) -> RBOutput<T, ExternalBuffer<Atomic<T>>> {
+pub fn wrap_external_source<T: Default>(par: &ExternalBufferParameters<T>, start_time: usize) -> RBOutput<T, ExternalBuffer<Atomic<T>>> {
   let external = unsafe { ExternalBuffer::<Atomic<T>>::new(par.ptr, par.length, par.valid.clone()) };
   let shared = RingBufferShared::new(external, par.stride, start_time);
   RBOutput{ rb: shared }
 }
 
-pub fn wrap_external_sink<T: Default>(par: &ExternalBufferParameters<T>, start_time: Clock, hole_fix_wait: usize) -> RBInput<T, ExternalBuffer<Atomic<T>>> {
+pub fn wrap_external_sink<T: Default>(par: &ExternalBufferParameters<T>, start_time: usize, hole_fix_wait: usize) -> RBInput<T, ExternalBuffer<Atomic<T>>> {
   let external = unsafe { ExternalBuffer::<Atomic<T>>::new(par.ptr, par.length, par.valid.clone()) };
   let shared = RingBufferShared::new(external, par.stride, start_time);
   RBInput{ rb: shared.clone(), item_ready: boolvec![false; shared.items_size], hole_fix_wait }

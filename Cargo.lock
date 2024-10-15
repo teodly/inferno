@@ -1862,8 +1862,8 @@ dependencies = [
 
 [[package]]
 name = "usrvclock"
-version = "0.1.1"
-source = "git+https://gitlab.com/lumifaza/usrvclock-rs#24da792ee30d69d696ad36f1599787090688c9d9"
+version = "0.1.2"
+source = "git+https://gitlab.com/lumifaza/usrvclock-rs#53116cb61f4f09d5a6da4c893bf11ea4eb5c958a"
 dependencies = [
  "custom_error",
  "nix 0.29.0",

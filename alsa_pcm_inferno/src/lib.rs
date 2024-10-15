@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 
 enum Command {
-    Receive(Vec<ExternalBufferParameters<Sample>>, oneshot::Receiver<usize>, oneshot::Sender<RealTimeClockReceiver>, Arc<AtomicUsize>),
-    Transmit(Vec<ExternalBufferParameters<Sample>>, oneshot::Receiver<usize>, oneshot::Sender<RealTimeClockReceiver>, Arc<AtomicUsize>),
+    Receive(Vec<ExternalBufferParameters<Sample>>, oneshot::Receiver<u64>, oneshot::Sender<RealTimeClockReceiver>, Arc<AtomicUsize>),
+    Transmit(Vec<ExternalBufferParameters<Sample>>, oneshot::Receiver<u64>, oneshot::Sender<RealTimeClockReceiver>, Arc<AtomicUsize>),
     StopReceiver,
     StopTransmitter,
     Shutdown,
@@ -104,7 +104,7 @@ fn init_common(self_info: DeviceInfo) {
 }
 
 struct StreamInfo {
-    boundary: usize,
+    boundary: snd_pcm_uframes_t,
 }
 
 #[repr(C)]
@@ -118,7 +118,7 @@ struct MyIOPlug {
     media_clock: MediaClock,
     clock_receiver: Option<RealTimeClockReceiver>,
     start_time: Option<usize>,
-    start_time_tx: Option<oneshot::Sender<usize>>,
+    start_time_tx: Option<oneshot::Sender<u64>>,
     current_timestamp: Arc<AtomicUsize>,
     // TODO refactor multiple Options to single Option<struct>
 }
@@ -132,11 +132,12 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     let cur = this.current_timestamp.load(Ordering::SeqCst /*XXX*/);
 
     // TODO may be non-monotonic in edge cases (switching between clocks)
-    let ptr = if this.start_time.is_some() && (cur != usize::MAX) {
+    // TODO rethink int sizes here
+    let ptr: isize = if this.start_time.is_some() && (cur != usize::MAX) {
         //println!("using current_timestamp: {cur}");
         // It is important to use actual input/output clock here because sample precision is required.
         // Otherwise app may overwrite not-yet-sent samples or read not-yet-received ones.
-        cur.wrapping_sub(this.start_time.unwrap()) as i64
+        cur.wrapping_sub(this.start_time.unwrap()) as isize
     } else {
         //println!("using own clock");
         // ... but fall back to system clock when not transmitting/receiving
@@ -148,13 +149,13 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
             }
         }
         let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
-        /* if now_samples_opt.is_some() && this.start_time.is_none() {
+        if now_samples_opt.is_some() && this.start_time.is_none() {
             println!("warning: setting start_time in plugin_pointer, not plugin_start");
-            this.start_time = now_samples_opt;
+            this.start_time = Some(now_samples_opt.unwrap() as usize);
             this.start_time_tx.take().unwrap().send(now_samples_opt.unwrap()).expect("failed to send start timestamp");
-        } */
+        }
         if now_samples_opt.is_some() && this.start_time.is_some() {
-            now_samples_opt.unwrap().wrapping_sub(this.start_time.unwrap()) as i64
+            (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap()) as isize
         } else {
             0
         }
@@ -162,21 +163,24 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     };
     
     let (dir, buffered) = match (*io).stream {
-        SND_PCM_STREAM_CAPTURE => ("capture", ptr.wrapping_sub((*io).appl_ptr as i64)),
-        SND_PCM_STREAM_PLAYBACK => ("playback", ((*io).appl_ptr as i64).wrapping_sub(ptr)),
+        SND_PCM_STREAM_CAPTURE => ("capture", ptr.wrapping_sub((*io).appl_ptr as isize)),
+        SND_PCM_STREAM_PLAYBACK => ("playback", ((*io).appl_ptr as isize).wrapping_sub(ptr)),
         _ => ("???", 0)
     };
 
-    if buffered < 0 && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING) {
-        let ioplug_avail = snd_pcm_ioplug_avail(io, ptr as u64, (*io).appl_ptr);
-        let ioplug_hw_avail = snd_pcm_ioplug_hw_avail(io, ptr as u64, (*io).appl_ptr);
+    /* if buffered < 0 && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING) {
+        let ioplug_avail = snd_pcm_ioplug_avail(io, ptr.try_into().unwrap(), (*io).appl_ptr);
+        let ioplug_hw_avail = snd_pcm_ioplug_hw_avail(io, ptr.try_into().unwrap(), (*io).appl_ptr);
         println!("buffered for {dir}: {buffered} samples, avail {ioplug_avail}, hw_avail {ioplug_hw_avail}");
         
-        return (-EPIPE) as i64; // report xrun
+        //return (-EPIPE).try_into().unwrap(); // report xrun
         // TODO check for xruns in ExternalRingBuffer because this function may be called too seldom
         // FIXME we're restarting the whole transmitter/receiver on xrun which results in a LONG break, unacceptable!
-    }
-    ptr
+    } */
+    // TODO boundary for buffered
+    let r = (ptr % (this.stream_info.as_ref().unwrap().boundary as isize)) as snd_pcm_sframes_t;
+    //println!("ptr: {} -> {}", ptr, r);
+    r
 }
 
 fn get_app_name() -> Option<String> {
@@ -218,7 +222,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     if snd_pcm_sw_params_malloc(&mut swparams) != 0 {
         panic!("snd_pcm_sw_params_malloc failed");
     }
-    let boundary = if snd_pcm_sw_params_current((*io).pcm, swparams) == 0 {
+    let boundary: snd_pcm_uframes_t = if snd_pcm_sw_params_current((*io).pcm, swparams) == 0 {
         let mut value = 0;
         snd_pcm_sw_params_get_boundary(swparams, &mut value);
         value
@@ -229,11 +233,11 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     assert!(boundary != 0);
     println!("boundary: {boundary}");
     this.stream_info = Some(StreamInfo {
-        boundary: boundary as usize // TODO use this
+        boundary // TODO use this
     });
     this.start_time = None;
 
-    let (start_time_tx, start_time_rx) = oneshot::channel::<usize>();
+    let (start_time_tx, start_time_rx) = oneshot::channel::<u64>();
     let (clock_tx, clock_rx) = oneshot::channel::<RealTimeClockReceiver>();
 
     init_common(this.self_info.clone());
@@ -287,7 +291,7 @@ unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
     }
     let now_samples_opt = this.media_clock.now_in_timebase((*io).rate as u64);
     if now_samples_opt.is_some() && this.start_time.is_none() {
-        this.start_time = now_samples_opt;
+        this.start_time = Some(now_samples_opt.unwrap() as usize);
         this.start_time_tx.take().unwrap().send(now_samples_opt.unwrap()).expect("failed to send start timestamp");
     }
     0
@@ -410,6 +414,21 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
     let r = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_CHANNELS as i32, 1, [num_channels].as_ptr());
     if r < 0 {
         panic!("snd_pcm_ioplug_set_param_list SND_PCM_IOPLUG_HW_CHANNELS returned {r}");
+    }
+
+    let r = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIOD_BYTES as i32, num_channels*4*64, num_channels*4*16384);
+    if r < 0 {
+        panic!("snd_pcm_ioplug_set_param_minmax SND_PCM_IOPLUG_HW_PERIOD_BYTES returned {r}");
+    }
+
+    let r = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_BUFFER_BYTES as i32, num_channels*4*64, num_channels*4*16384);
+    if r < 0 {
+        panic!("snd_pcm_ioplug_set_param_minmax SND_PCM_IOPLUG_HW_BUFFER_BYTES returned {r}");
+    }
+
+    let r = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIODS as i32, 1, 8);
+    if r < 0 {
+        panic!("snd_pcm_ioplug_set_param_minmax SND_PCM_IOPLUG_HW_PERIODS returned {r}");
     }
 
     *pcmp = (*myio).io.pcm;

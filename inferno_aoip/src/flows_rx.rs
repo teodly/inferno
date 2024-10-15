@@ -101,9 +101,9 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                 };
                 match sd.bytes_per_sample {
                   // FIXME: in ALSA plugin there can be more than 1 sink per input channel because we skip SamplesCollector !!!
-                  2 => ch.sink.write_from_at(ts, S16ReaderIterator(reader)),
-                  3 => ch.sink.write_from_at(ts, S24ReaderIterator(reader)),
-                  4 => ch.sink.write_from_at(ts, S32ReaderIterator(reader)),
+                  2 => ch.sink.write_from_at(ts as usize, S16ReaderIterator(reader)),
+                  3 => ch.sink.write_from_at(ts as usize, S24ReaderIterator(reader)),
+                  4 => ch.sink.write_from_at(ts as usize, S32ReaderIterator(reader)),
                   other => {
                     error!("BUG: unsupported bytes per sample {}", other);
                     return Command::NoOp;
@@ -150,7 +150,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                   if let Some(socket_data) = socket_opt {
                     for channel_opt in &mut socket_data.channels {
                       if let Some(channel) = channel_opt {
-                        channel.timestamp_shift = 0isize.wrapping_sub_unsigned(start_time).wrapping_add_unsigned(channel.latency_samples);
+                        channel.timestamp_shift = 0i64.wrapping_sub_unsigned(start_time).wrapping_add_unsigned(channel.latency_samples.try_into().unwrap()) as ClockDiff;
                         // FIXME DRY
                       }
                     }
@@ -195,7 +195,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               self.sockets[socket_id].as_mut().unwrap().channels[channel_index] = Some(Channel {
                 sink,
                 latency_samples,
-                timestamp_shift: start_timestamp.map(|start_ts| 0isize.wrapping_sub_unsigned(start_ts).wrapping_add_unsigned(latency_samples)).unwrap_or(0)
+                timestamp_shift: start_timestamp.map(|start_ts| 0i64.wrapping_sub_unsigned(start_ts).wrapping_add_unsigned(latency_samples.try_into().unwrap())).unwrap_or(0)
               });
             }
             Command::DisconnectChannel { socket_index: socket_id, channel_index } => {

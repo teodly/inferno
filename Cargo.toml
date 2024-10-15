@@ -8,3 +8,10 @@ members = [
     "inferno_wired",
     "alsa_pcm_inferno",
 ]
+
+[workspace.metadata.cross.target.armv7-unknown-linux-musleabihf]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get --assume-yes install libasound-dev:$CROSS_DEB_ARCH"
+]
+

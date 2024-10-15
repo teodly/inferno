@@ -27,7 +27,7 @@ pub const FPP_MAX: u16 = 256;
 pub const FPP_MAX_ADVERTISED: u16 = 32;
 pub const MAX_FLOWS: u32 = 128;
 pub const MAX_CHANNELS_IN_FLOW: u16 = 8;
-pub const KEEPALIVE_TIMEOUT_SECONDS: usize = 4;
+pub const KEEPALIVE_TIMEOUT_SECONDS: Clock = 4;
 pub const MAX_LAG_SAMPLES: usize = 4800;
 pub const DISCONTINUITY_THRESHOLD_SAMPLES: usize = 192000;
 const BUFFERED_SAMPLES_PER_CHANNEL: usize = 65536;
@@ -48,11 +48,11 @@ struct Flow {
 
 impl Flow {
   fn bootstrap_next_ts(&mut self, now: Clock) {
-    let remainder = now % self.fpp;
-    self.next_ts = now.wrapping_add(self.fpp - remainder);
+    let remainder = now % (self.fpp as Clock);
+    self.next_ts = now.wrapping_add(self.fpp as Clock - remainder);
   }
   fn keep_alive(&mut self, now: Clock, sample_rate: u32) {
-    self.expires = now.wrapping_add(KEEPALIVE_TIMEOUT_SECONDS * sample_rate as usize);
+    self.expires = now.wrapping_add(KEEPALIVE_TIMEOUT_SECONDS * sample_rate as Clock);
   }
 }
 
@@ -99,11 +99,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         let channels_in_flow = flow.channel_indices.len();
         let stride = channels_in_flow * flow.bytes_per_sample;
         let lag = wrapped_diff(now, flow.next_ts);
-        if lag > max_lag_samples as isize {
+        if lag > max_lag_samples as ClockDiff {
           error!("tx lag of {} samples detected, or media clock jumped, dropout occurs!", lag);
           flow.bootstrap_next_ts(now);
         }
-        if lag < -(DISCONTINUITY_THRESHOLD_SAMPLES as isize) {
+        if lag < -(DISCONTINUITY_THRESHOLD_SAMPLES as ClockDiff) {
           error!("media clock jumped: {}", lag);
           flow.bootstrap_next_ts(now);
         }
@@ -120,7 +120,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
             if let Some(ch_index) = ch_opt {
               //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
               // TODO remove not really necessary copy to tmp_samples, write_*_samples could read directly from ring buffer
-              let r = self.channels_sources[ch_index].read_at(start_ts, &mut tmp_samples[0..flow.fpp]);
+              let r = self.channels_sources[ch_index].read_at(start_ts as usize, &mut tmp_samples[0..flow.fpp]);
               if r.useful_start_index != 0 || r.useful_end_index != flow.fpp {
                 error!("didn't have enough samples, transmitting silence. {} {}", r.useful_start_index, flow.fpp-r.useful_end_index);
 
@@ -145,7 +145,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
           let to_send = 9 + stride * flow.fpp;
           if let Ok(written) = flow.socket.send(&pbuff[0..to_send]) {
             if written == to_send {
-              flow.next_ts = flow.next_ts.wrapping_add(flow.fpp);
+              flow.next_ts = flow.next_ts.wrapping_add(flow.fpp.try_into().unwrap());
             } else {
               warn!("written {written}, should have {to_send}");
             }
@@ -180,7 +180,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
     if let Some(rx) = &mut start_time_rx {
       match rx.await {
         Ok(start_time) => {
-          self.timestamp_shift = 0isize.wrapping_sub_unsigned(start_time).wrapping_sub_unsigned(self.send_latency_samples);
+          self.timestamp_shift = 0i64.wrapping_sub_unsigned(start_time).wrapping_sub_unsigned(self.send_latency_samples.try_into().unwrap());
         },
         Err(e) => {
           error!("unable to get start timestamp for ring buffer output: {e:?}");
@@ -197,7 +197,7 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       counter += 1;
 
       let command = if sleep_duration < SELECT_THRESHOLD {
-        self.current_timestamp.store(min_next_ts.unwrap_or(usize::MAX), Ordering::SeqCst /*XXX*/);
+        self.current_timestamp.store(min_next_ts.map(|n|n.try_into().unwrap()).unwrap_or(usize::MAX), Ordering::SeqCst /*XXX*/);
         std::thread::sleep(sleep_duration);
         self.transmit(&mut dither_rng, process_events);
         if process_events {
@@ -287,15 +287,15 @@ fn split_handle(h: FlowHandle) -> (u32, u16) {
 
 impl FlowsTransmitter {
   async fn run<P: ProxyToSamplesBuffer>(rx: mpsc::Receiver<Command>, sample_rate: u32, latency_ns: usize, channels_outputs: Vec<RBOutput<Sample, P>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, current_timestamp: Arc<AtomicUsize>) {
-    let latency = latency_ns * sample_rate as usize / 1_000_000_000;
+    let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
     let mut internal = FlowsTransmitterInternal {
       commands_receiver: rx,
       sample_rate,
       flows: (0..MAX_FLOWS).map(|_|None).collect_vec(),
       clock: MediaClock::new(),
       channels_sources: channels_outputs,
-      send_latency_samples: latency, // TODO in ALSA plugin should be 0, the more the worse because aplay wants to fill the whole buffer
-      timestamp_shift: 0isize.wrapping_sub_unsigned(latency),
+      send_latency_samples: latency.try_into().unwrap(), // TODO in ALSA plugin should be 0, the more the worse because aplay wants to fill the whole buffer
+      timestamp_shift: 0i64.wrapping_sub_unsigned(latency.into()),
       current_timestamp,
       /* callback: Box::new(|mut timestamp: Clock, ch_index: usize, buffer: &mut [Sample]| {
         let period = 4 << ch_index;

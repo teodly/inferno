@@ -162,7 +162,7 @@ impl OwnedBuffering {
 
 impl ChannelsBuffering<OwnedBuffer<Atomic<Sample>>> for OwnedBuffering {
   fn get_io(&self, start_time: Clock, _channel_index: usize) -> (RBInput<Sample, OwnedBuffer<Atomic<Sample>>>, Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>) {
-    let (input, output) = ring_buffer::new_owned::<Sample>(self.buffer_length, start_time, self.hole_fix_wait);
+    let (input, output) = ring_buffer::new_owned::<Sample>(self.buffer_length, start_time as usize, self.hole_fix_wait);
     (input, Some(output))
   }
   /* fn samples_collector(&self) -> Option<Arc<SamplesCollector<OwnedBuffer<Atomic<Sample>>>>> {
@@ -171,7 +171,7 @@ impl ChannelsBuffering<OwnedBuffer<Atomic<Sample>>> for OwnedBuffering {
   fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, OwnedBuffer<Atomic<Sample>>>> {
     let (sink, source) = if rb_output.is_none() {
       let (sink, source) =
-        ring_buffer::new_owned::<Sample>(self.buffer_length, start_time, self.hole_fix_wait);
+        ring_buffer::new_owned::<Sample>(self.buffer_length, start_time as usize, self.hole_fix_wait);
       *rb_output = Some(source.clone());
       (Some(sink), source)
     } else {
@@ -207,11 +207,11 @@ impl ExternalBuffering {
 
 impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
   fn get_io(&self, start_time: Clock, channel_index: usize) -> (RBInput<Sample, ExternalBuffer<Atomic<Sample>>>, Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>) {
-    (ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time, self.hole_fix_wait), None)
+    (ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time as usize, self.hole_fix_wait), None)
   }
   fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, ExternalBuffer<Atomic<Sample>>>> {
     debug_assert!(rb_output.is_none());
-    Some(ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time, self.hole_fix_wait))
+    Some(ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time as usize, self.hole_fix_wait))
   }
   fn disconnect_channel(&self, _channel_index: usize) {
   }
@@ -676,7 +676,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
             first.tx_channels_per_flow.min(self.self_info.rx_channels.len()).min(8), /*TODO make it configurable*/
             tx_channels,
             first.dbcp1,
-            first.min_rx_latency_ns.max(self.min_latency_ns) * (self.self_info.sample_rate as usize) / 1_000_000_000,
+            ((first.min_rx_latency_ns as u64).max(self.min_latency_ns as u64) * (self.self_info.sample_rate as u64) / 1_000_000_000u64).try_into().unwrap(),
             self.ref_instant.elapsed().as_secs() as _,
           );
 
