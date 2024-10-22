@@ -14,6 +14,7 @@ pub struct DeviceInfo {
   pub model_name: String,
   pub model_number: String, // _000000000000000b
   pub factory_device_id: [u8; 8],
+  pub process_id: u16,
   pub vendor_string: String,
   pub friendly_hostname: String, // TODO limit length, otherwise DC ignores the device
   pub factory_hostname: String,
@@ -23,6 +24,11 @@ pub struct DeviceInfo {
   pub pcm_type: u8, // usually 0xe, in older devices 4
   pub latency_ns: usize,
   pub sample_rate: u32,
+
+  pub arc_port: u16,
+  pub cmc_port: u16,
+  pub flows_control_port: u16,
+  pub info_request_port: u16,
 }
 
 impl DeviceInfo {

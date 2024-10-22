@@ -1,7 +1,7 @@
 use crate::common::*;
 use crate::byte_utils::*;
 use crate::net_utils::UdpSocketWrapper;
-use crate::protocol::mcast::{make_packet, INFO_REQUEST_PORT};
+use crate::protocol::mcast::make_packet;
 use crate::{byte_utils::write_str_to_buffer, device_info::DeviceInfo};
 use std::{
   net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -15,7 +15,6 @@ use tokio::{
   time::MissedTickBehavior,
 };
 
-const BIND_PORT: u16 = INFO_REQUEST_PORT;
 const SEND_BUFFER_SIZE: usize = 1500;
 const DST_PORT_HEARTBEAT: u16 = 8708;
 const DST_PORT_DEVICE_INFO: u16 = 8702;
@@ -74,6 +73,7 @@ impl<'s> Multicaster<'s> {
       &mut self.send_buffer,
       start_code,
       self.seqnum,
+      self.self_info.process_id,
       self.self_info.factory_device_id,
       self.vendor,
       opcode,
@@ -125,7 +125,7 @@ impl<'s> Multicaster<'s> {
     write_str_to_buffer(&mut content, 0x2c, 16, &self.self_info.manufacturer);
     write_str_to_buffer(&mut content, 0xac, 16, &self.self_info.model_name);
     // version number:
-    content[0x12c..0x130].copy_from_slice(&[0, 0, 0, 0]);
+    content[0x12c..0x130].copy_from_slice(&self.library_version_bytes);
 
     self
       .send(self.device_info_destination, 0xffff, [0x07, 0x2a, 0x00, 0xc0, 0, 0, 0, 0], &content)
@@ -177,7 +177,7 @@ pub async fn run_server(
   mut rx: mpsc::Receiver<MulticastMessage>,
   shutdown: BroadcastReceiver<()>,
 ) {
-  let server = UdpSocketWrapper::new(Some(self_info.ip_address), BIND_PORT, shutdown);
+  let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.info_request_port, shutdown).await;
   let mut mcaster = Multicaster::new(self_info.as_ref(), server);
   mcaster.send_board_info().await;
   mcaster.send_product_info().await;

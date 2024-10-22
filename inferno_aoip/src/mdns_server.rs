@@ -6,7 +6,6 @@ use searchfire::{
 use std::{net::IpAddr, sync::Arc};
 
 use crate::{device_info::DeviceInfo, flows_tx::FPP_MAX_ADVERTISED};
-use crate::protocol::{proto_arc::PORT as ARC_PORT, proto_cmc::PORT as CMC_PORT, flows_control::PORT as FLOWS_CONTROL_PORT};
 use crate::flows_tx::{FPP_MIN, FPP_MAX, MAX_CHANNELS_IN_FLOW};
 
 fn kv<T: std::fmt::Display>(key: &str, value: T) -> String {
@@ -22,7 +21,7 @@ pub fn start_server(self_info: Arc<DeviceInfo>) -> BroadcasterHandle {
     //.loopback()
     .interface_v4(TargetInterface::Specific(self_info.ip_address))
     .add_service(
-      ServiceBuilder::new(service_type("_netaudio-arc"), hostname.clone(), ARC_PORT)
+      ServiceBuilder::new(service_type("_netaudio-arc"), hostname.clone(), self_info.arc_port)
         .unwrap()
         .add_ip_address(IpAddr::V4(self_info.ip_address))
         .add_txt_truncated("arcp_vers=2.7.41")
@@ -36,11 +35,11 @@ pub fn start_server(self_info: Arc<DeviceInfo>) -> BroadcasterHandle {
         .unwrap(),
     )
     .add_service(
-      ServiceBuilder::new(service_type("_netaudio-cmc"), hostname, CMC_PORT)
+      ServiceBuilder::new(service_type("_netaudio-cmc"), hostname, self_info.cmc_port)
         .unwrap()
         .add_ip_address(IpAddr::V4(self_info.ip_address))
         .add_txt_truncated(kv("id", &hex::encode(self_info.factory_device_id)))
-        .add_txt_truncated("process=0") // ??? maybe for Dante Via ???
+        .add_txt_truncated(kv("process", self_info.process_id))
         .add_txt_truncated("cmcp_vers=1.2.0")
         .add_txt_truncated("cmcp_min=1.0.0")
         .add_txt_truncated("server_vers=4.0.2")
@@ -56,7 +55,7 @@ pub fn start_server(self_info: Arc<DeviceInfo>) -> BroadcasterHandle {
   for (index, txch) in self_info.tx_channels.iter().enumerate() {
     let service = |ch_name: &str, default: bool| {
       let name = Name::from_labels([format!("{}@{}", ch_name, self_info.friendly_hostname).as_bytes()]).unwrap();
-      let mut b = ServiceBuilder::new(service_type("_netaudio-chan"), name, FLOWS_CONTROL_PORT)
+      let mut b = ServiceBuilder::new(service_type("_netaudio-chan"), name, self_info.flows_control_port)
         .unwrap()
         .add_ip_address(IpAddr::V4(self_info.ip_address))
         .add_txt_truncated("txtvers=2")

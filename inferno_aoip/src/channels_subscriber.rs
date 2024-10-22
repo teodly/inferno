@@ -670,6 +670,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
           };
           let tx_channels = chunk.iter().map(|(_, chadv)| chadv.tx_channel_id);
           let flow_id = flow_index + 1;
+          let flow_name = format!("{}_{}", self.self_info.process_id, flow_id);
           let flow = Flow::new(
             flow_id,
             first.addr,
@@ -722,7 +723,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
                 first.fpp_max, // TODO fpp selection, here we use max for lowest overhead
                 &tx_channels,
                 port,
-                &flow_id.to_string(),
+                &flow_name,
               )
               .await
             {

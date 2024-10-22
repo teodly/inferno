@@ -18,6 +18,7 @@ pub fn make_packet<'a>(
   buffer: &'a mut [u8],
   start_code: u16,
   seqnum: u16,
+  process: u16,
   factory_device_id: [u8; 8],
   vendor_str: [u8; 8],
   opcode: [u8; 8],
@@ -30,7 +31,7 @@ pub fn make_packet<'a>(
   view.start_code_mut().write(start_code);
   view.total_length_mut().write(total_len as u16);
   view.seqnum_mut().write(seqnum);
-  view.process_mut().write(0);
+  view.process_mut().write(process);
   view.factory_device_id_mut().copy_from_slice(&factory_device_id);
   view.vendor_mut().copy_from_slice(&vendor_str);
   view.opcode_mut().copy_from_slice(&opcode);

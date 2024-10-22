@@ -3,7 +3,6 @@ use crate::channels_subscriber::ChannelsSubscriber;
 
 use crate::device_info::DeviceInfo;
 use crate::net_utils::UdpSocketWrapper;
-use crate::protocol::proto_arc::PORT;
 use crate::protocol::req_resp;
 use crate::protocol::req_resp::HEADER_LENGTH;
 use bytebuffer::{ByteBuffer, Endian};
@@ -18,7 +17,7 @@ pub async fn run_server(
   shutdown: BroadcastReceiver<()>,
 ) {
   let mut subscriber = None;
-  let server = UdpSocketWrapper::new(Some(self_info.ip_address), PORT, shutdown);
+  let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.arc_port, shutdown).await;
   let mut conn = req_resp::Connection::new(server);
   while conn.should_work() {
     let request = match conn.recv().await {

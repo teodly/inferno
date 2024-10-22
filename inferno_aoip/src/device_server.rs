@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::Write;
 use std::mem::size_of;
-use std::env;
+use std::{env, os};
 use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
@@ -33,6 +33,10 @@ use tokio::sync::{broadcast as broadcast_queue, mpsc, watch};
 use crate::device_info::{Channel, DeviceInfo};
 
 use crate::{common::*, MediaClock, RealTimeClockReceiver};
+use crate::protocol::proto_arc::PORT as ARC_PORT;
+use crate::protocol::proto_cmc::PORT as CMC_PORT;
+use crate::protocol::flows_control::PORT as FLOWS_CONTROL_PORT;
+use crate::protocol::mcast::INFO_REQUEST_PORT as INFO_REQUEST_PORT;
 
 pub trait SelfInfoBuilder {
   fn new_self(app_name: &str, short_app_name: &str, my_ip: Option<Ipv4Addr>) -> DeviceInfo;
@@ -67,12 +71,13 @@ impl SelfInfoBuilder for DeviceInfo {
     let sample_rate = env::var("INFERNO_SAMPLE_RATE").ok().
       map(|s|s.parse().expect("invalid INFERNO_SAMPLE_RATE, must be integer")).unwrap_or(48000);
 
-    DeviceInfo {
+    let mut result = DeviceInfo {
       ip_address: my_ipv4,
       board_name: "Inferno-AoIP".to_owned(),
       manufacturer: "Inferno-AoIP".to_owned(),
       model_name: app_name.to_owned(),
       factory_device_id: devid,
+      process_id: 0,
       vendor_string: "Audinate Dante-compatible".to_owned(),
       factory_hostname: format!("{short_app_name}-{}", hex::encode(devid)),
       friendly_hostname,
@@ -83,7 +88,25 @@ impl SelfInfoBuilder for DeviceInfo {
       pcm_type: 0xe,
       latency_ns: 10_000_000, // TODO make it configurable
       sample_rate,
+
+      arc_port: ARC_PORT,
+      cmc_port: CMC_PORT,
+      flows_control_port: FLOWS_CONTROL_PORT,
+      info_request_port: INFO_REQUEST_PORT,
+    };
+
+    if let Some(process_id) = env::var("INFERNO_PROCESS_ID").ok().map(|s|s.parse().expect("INFERNO_PROCESS_ID must be u16")) {
+      result.process_id = process_id;
     }
+
+    if let Some(altport) = env::var("INFERNO_ALT_PORT").ok().map(|s|s.parse().expect("INFERNO_ALT_PORT must be u16")) {
+      result.arc_port = altport;
+      result.cmc_port = altport+1;
+      result.flows_control_port = altport+2;
+      result.info_request_port = altport+3;
+    }
+
+    result
   }
   fn make_rx_channels(mut self, count: usize) -> DeviceInfo {
     self.rx_channels = (1..=count)

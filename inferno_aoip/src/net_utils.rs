@@ -19,17 +19,19 @@ pub struct UdpSocketWrapper {
 }
 
 impl UdpSocketWrapper {
-  pub fn new(
+  pub async fn new(
     listen_addr: Option<Ipv4Addr>,
     listen_port: u16,
     shutdown: Receiver<()>,
   ) -> UdpSocketWrapper {
+    let listen_addr = listen_addr.unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
+    let socket_opt = UdpSocket::bind(SocketAddr::new(std::net::IpAddr::V4(listen_addr), listen_port)).await;
+    let socket = socket_opt.expect("error starting really needed listener");
+    // TODO MAY PANIC: this error should be non-fatal because some apps may use Inferno as an optional audio I/O
+    let listen_port = socket.local_addr().unwrap().port();
     UdpSocketWrapper {
-      listen_addr: match listen_addr {
-        Some(ip) => ip,
-        None => Ipv4Addr::new(0, 0, 0, 0),
-      },
-      socket: None,
+      listen_addr,
+      socket: Some(socket),
       listen_port,
       shutdown,
       dowork: true,
@@ -38,68 +40,40 @@ impl UdpSocketWrapper {
   }
 
   pub fn should_work(&self) -> bool {
-    return self.dowork;
+    self.dowork
   }
 
-  async fn ensure_we_have_socket(&mut self) {
-    loop {
-      if self.socket.is_some() {
-        break;
-      }
-      select! {
-        r = UdpSocket::bind(SocketAddr::new(std::net::IpAddr::V4(self.listen_addr), self.listen_port)) => {
-          match r {
-            Ok(s) => {
-              self.socket = Some(s);
-            },
-            Err(e) => {
-              error!("error binding to socket: {e:?}");
-              sleep(Duration::from_secs(1)).await;
-            }
-          }
-        },
-        _ = self.shutdown.recv() => {
-          self.socket = None;
-          self.dowork = false;
-          break;
-        }
-      };
-    }
+  pub fn port(&self) -> u16 {
+    self.listen_port
   }
 
   pub async fn recv(&mut self) -> Option<(SocketAddr, &[u8])> {
-    loop {
-      self.ensure_we_have_socket().await;
-      let socket = match &self.socket {
-        Some(s) => s,
-        None => {
-          return None;
-        }
-      };
-      select! {
-        r = socket.recv_from(&mut self.recv_buff) => {
-          match r {
-            Ok((len_recv, src)) => {
-              return Some((src, &self.recv_buff[..len_recv]));
-            },
-            Err(e) => {
-              error!("error receiving from socket: {e:?}");
-              sleep(Duration::from_secs(1)).await;
-              // TODO maybe destroy socket?
-              continue;
-            }
+    let socket = match &self.socket {
+      Some(s) => s,
+      None => {
+        return None;
+      }
+    };
+    select! {
+      r = socket.recv_from(&mut self.recv_buff) => {
+        match r {
+          Ok((len_recv, src)) => {
+            return Some((src, &self.recv_buff[..len_recv]));
+          },
+          Err(e) => {
+            error!("error receiving from socket: {e:?}");
+            return None;
           }
-        },
-        _ = self.shutdown.recv() => {
-          self.dowork = false;
-          return None;
         }
-      };
-    }
+      },
+      _ = self.shutdown.recv() => {
+        self.dowork = false;
+        return None;
+      }
+    };
   }
 
   pub async fn send(&mut self, dst: &SocketAddr, packet: &[u8]) {
-    self.ensure_we_have_socket().await;
     let socket = match &self.socket {
       Some(s) => s,
       None => {

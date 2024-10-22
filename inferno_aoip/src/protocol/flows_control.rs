@@ -144,7 +144,10 @@ impl FlowsControlClient {
     body.write_u16(0x0002);
     body.write_u16(fpp);
     body.write_u16(rx_flow_name_offset);
-    body.write_bytes(&[0; 12]);
+    /* for _ in 0..6 {
+      body.write_u16(self.self_info.process_id); // XXX testing
+    } */
+    body.write_bytes(&[0; 12]); // XXX testing
     assert_eq!(body.get_wpos(), strings_offset - HEADER_LENGTH);
     body.write_bytes(strings.as_bytes());
 

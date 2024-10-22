@@ -5,7 +5,7 @@ use crate::common::*;
 
 use crate::flows_tx::{FlowsTransmitter, FPP_MAX};
 use crate::protocol::flows_control::{FlowControlError, FlowHandle};
-use crate::{byte_utils::{make_u16, read_0term_str_from_buffer}, device_info::DeviceInfo, net_utils::UdpSocketWrapper, protocol::{flows_control::PORT, req_resp}};
+use crate::{byte_utils::{make_u16, read_0term_str_from_buffer}, device_info::DeviceInfo, net_utils::UdpSocketWrapper, protocol::req_resp};
 use crate::protocol::req_resp::{make_packet, req_resp_packet, HEADER_LENGTH};
 use tokio::sync::broadcast::Receiver as BroadcastReceiver;
 
@@ -14,7 +14,7 @@ pub async fn run_server(
   mut flows: FlowsTransmitter,
   shutdown: BroadcastReceiver<()>
 ) {
-  let server = UdpSocketWrapper::new(Some(self_info.ip_address), PORT, shutdown);
+  let server = UdpSocketWrapper::new(Some(self_info.ip_address), self_info.flows_control_port, shutdown).await;
   let mut conn = req_resp::Connection::new(server);
   while conn.should_work() {
     let request = match conn.recv().await {
