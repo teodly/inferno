@@ -205,22 +205,22 @@ impl DeviceServer {
     let (col, col_fut) = SamplesCollector::<OwnedBuffer<Atomic<Sample>>>::new_with_callback(self.self_info.clone(), Box::new(samples_callback));
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
-    self.receive(tasks, None, buffering, Default::default()).await;
+    self.receive(tasks, None, buffering, Default::default(), None).await;
   }
   pub async fn receive_realtime(&mut self) -> RealTimeSamplesReceiver<OwnedBuffer<Atomic<Sample>>> {
     let (col, col_fut, rt_recv) = SamplesCollector::new_realtime(self.self_info.clone(), self.get_realtime_clock_receiver());
     let tasks = vec![tokio::spawn(col_fut)];
     let buffering = OwnedBuffering::new(524288 /*TODO*/, 4800 /*TODO*/, Arc::new(col));
-    self.receive(tasks, None, buffering, Default::default()).await;
+    self.receive(tasks, None, buffering, Default::default(), None).await;
 
     rt_recv
   }
-  pub async fn receive_to_external_buffer(&mut self, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>, current_timestamp: Arc<AtomicUsize>) {
+  pub async fn receive_to_external_buffer(&mut self, rx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>, current_timestamp: Arc<AtomicUsize>, on_transfer: Box<dyn Fn() + Send>) {
     let buffering = ExternalBuffering::new(rx_channels_buffers, 4800 /*TODO*/);
-    self.receive(vec![], Some(start_time_rx), buffering, current_timestamp).await;
+    self.receive(vec![], Some(start_time_rx), buffering, current_timestamp, Some(on_transfer)).await;
   }
-  async fn receive<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(&mut self, mut tasks: Vec<JoinHandle<()>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, channels_buffering: B, current_timestamp: Arc<AtomicUsize>) {
-    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self.self_info.clone(), self.ref_instant, start_time_rx, current_timestamp);
+  async fn receive<P: ProxyToSamplesBuffer + Send + Sync + 'static, B: ChannelsBuffering<P> + Send + Sync + 'static>(&mut self, mut tasks: Vec<JoinHandle<()>>, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, channels_buffering: B, current_timestamp: Arc<AtomicUsize>, on_transfer: Option<Box<dyn Fn() + Send>>) {
+    let (flows_rx_handle, flows_rx_thread) = crate::flows_rx::FlowsReceiver::start(self.self_info.clone(), self.get_realtime_clock_receiver(), self.ref_instant, start_time_rx, current_timestamp, on_transfer);
     let flows_rx_handle = Arc::new(flows_rx_handle);
     let (channels_sub_handle, channels_sub_worker) = ChannelsSubscriber::new(
       self.self_info.clone(),
@@ -252,14 +252,14 @@ impl DeviceServer {
     self.rx_shutdown_todo.take().unwrap().await;
   }
 
-  pub async fn transmit_from_external_buffer(&mut self, tx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>, current_timestamp: Arc<AtomicUsize>) {
+  pub async fn transmit_from_external_buffer(&mut self, tx_channels_buffers: Vec<ExternalBufferParameters<Sample>>, start_time_rx: tokio::sync::oneshot::Receiver<Clock>, current_timestamp: Arc<AtomicUsize>, on_transfer: Box<dyn Fn() + Send>) {
     let rb_outputs = tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
-    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp).await;
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, Some(on_transfer)).await;
   }
-  async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(&mut self, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, rb_outputs: Vec<RBOutput<Sample, P>>, current_timestamp: Arc<AtomicUsize>) {
+  async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(&mut self, start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>, rb_outputs: Vec<RBOutput<Sample, P>>, current_timestamp: Arc<AtomicUsize>, on_transfer: Option<Box<dyn Fn() + Send>>) {
     let clock_rx = self.clock_receiver.subscribe();
     
-    let (flows_tx_handle, flows_tx_thread) = FlowsTransmitter::start(self.self_info.clone(), clock_rx, rb_outputs, start_time_rx, current_timestamp.clone());
+    let (flows_tx_handle, flows_tx_thread) = FlowsTransmitter::start(self.self_info.clone(), clock_rx, rb_outputs, start_time_rx, current_timestamp.clone(), on_transfer);
     let (shutdown_send, shutdown_recv) = broadcast_queue::channel(16);
     let flows_control_task = tokio::spawn(crate::flows_control_server::run_server(self.self_info.clone(), flows_tx_handle, shutdown_recv));
     self.tx_shutdown_todo = Some(async move {

@@ -49,10 +49,11 @@ impl MediaClock {
       let cur_ovl_time = cur_overlay.now_ns();
       let new_ovl_time = overlay.now_ns();
       let diff = (new_ovl_time as ClockDiff).wrapping_sub(cur_ovl_time as ClockDiff);
-      if diff.abs() > 200_000_000 {
+      /* if diff.abs() > 200_000_000 {
         error!("clock is trying to jump dangerously by {diff} ns, ignoring update");
         return;
-      }
+      } */
+     // XXX
     }
     self.overlay = Some(overlay);
   }
@@ -89,7 +90,7 @@ pub fn start_clock_receiver() -> ClockReceiver {
 pub async fn make_shared_media_clock(receiver: &ClockReceiver) -> Arc<RwLock<MediaClock>> {
   let mut rx = receiver.subscribe();
   let mut media_clock = MediaClock::new();
-  loop {
+  /* loop {
     match rx.recv().await {
       Ok(overlay) => {
         media_clock.update_overlay(overlay);
@@ -102,7 +103,8 @@ pub async fn make_shared_media_clock(receiver: &ClockReceiver) -> Arc<RwLock<Med
         warn!("clock receive error {e:?}");
       }
     }
-  }
+  } */
+  // initial await makes e.g. Audacity freeze when starting when Statime is not running. TODO figure it out
   let media_clock = Arc::new(RwLock::new(media_clock));
   let media_clock1 = media_clock.clone();
   tokio::spawn(async move {

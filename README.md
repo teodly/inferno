@@ -146,6 +146,7 @@ At this point, Inferno will roughly become alternative to Dante Virtual Soundcar
 * ability to work as a clock source (PTP leader)
 * ability to use non-default network ports to allow running multiple instances on a single IP address
 * automated integration test that will launch several instances, stream audio data between them and check for its correctness
+* bit-perfect transmitter (currently 32-bit integers are always used internally and conversion to 24-bit or 16-bit adds dither)
 * API: number of channels changeable without device server restart (useful for Dante Via-like operation where transmitters & receivers can be added and removed dynamically)
 * AES67
 * primary & secondary network support, for dual-NIC computers

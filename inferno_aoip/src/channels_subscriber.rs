@@ -142,8 +142,6 @@ impl ChannelsSubscriber {
 
 
 pub trait ChannelsBuffering<P: ProxyToSamplesBuffer> {
-  fn get_io(&self, start_time: Clock, channel_index: usize) -> (RBInput<Sample, P>, Option<RBOutput<Sample, P>>);
-  //fn samples_collector(&self) -> Option<Arc<SamplesCollector<P>>>;
   fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, P>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, P>>;
   fn disconnect_channel(&self, channel_index: usize);
 }
@@ -161,13 +159,6 @@ impl OwnedBuffering {
 }
 
 impl ChannelsBuffering<OwnedBuffer<Atomic<Sample>>> for OwnedBuffering {
-  fn get_io(&self, start_time: Clock, _channel_index: usize) -> (RBInput<Sample, OwnedBuffer<Atomic<Sample>>>, Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>) {
-    let (input, output) = ring_buffer::new_owned::<Sample>(self.buffer_length, start_time as usize, self.hole_fix_wait);
-    (input, Some(output))
-  }
-  /* fn samples_collector(&self) -> Option<Arc<SamplesCollector<OwnedBuffer<Atomic<Sample>>>>> {
-    Some(self.samples_collector.clone())
-  } */
   fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, OwnedBuffer<Atomic<Sample>>>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, OwnedBuffer<Atomic<Sample>>>> {
     let (sink, source) = if rb_output.is_none() {
       let (sink, source) =
@@ -206,9 +197,6 @@ impl ExternalBuffering {
 }
 
 impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
-  fn get_io(&self, start_time: Clock, channel_index: usize) -> (RBInput<Sample, ExternalBuffer<Atomic<Sample>>>, Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>) {
-    (ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time as usize, self.hole_fix_wait), None)
-  }
   fn connect_channel(&self, start_time: Clock, rb_output: &mut Option<RBOutput<Sample, ExternalBuffer<Atomic<Sample>>>>, channel_index: usize, latency_samples: usize) -> Option<RBInput<Sample, ExternalBuffer<Atomic<Sample>>>> {
     debug_assert!(rb_output.is_none());
     Some(ring_buffer::wrap_external_sink(&self.channels[channel_index], start_time as usize, self.hole_fix_wait))
@@ -320,7 +308,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
       flows: Arc::new(Mutex::new(vec![])),
       flows_recv,
       //buffered_samples_per_channel: 524288,
-      min_latency_ns: 30_000_000, // TODO dehardcode
+      min_latency_ns: 10_000_000, // TODO dehardcode
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
       subscriptions_info,

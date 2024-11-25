@@ -23,6 +23,7 @@ struct StartArgs {
     start_time_rx: oneshot::Receiver<u64>,
     clock_rx_tx: oneshot::Sender<RealTimeClockReceiver>,
     current_timestamp: Arc<AtomicUsize>,
+    on_transfer: Box<dyn Fn() + Send + Sync + 'static>,
 }
 
 enum Command {
@@ -67,18 +68,20 @@ fn init_common(self_info: DeviceInfo) {
         let (commands_sender, mut commands_rx) = mpsc::channel(16);
 
         let thread = run_future_in_new_thread("Inferno main", move || async move {
+            // TODO DeviceServer::start may fail internally (e.g. if other process using Inferno is already listening on network ports)
+            // retrying infinitely will spam the log. (Audacity behaves this way if Inferno is already running)
             let mut device_server = DeviceServer::start(self_info).await;
             loop {
                 match commands_rx.recv().await {
                     Some(command) => match command {
-                        Command::StartReceiver(StartArgs{channels, start_time_rx, clock_rx_tx, current_timestamp}) => {
+                        Command::StartReceiver(StartArgs{channels, start_time_rx, clock_rx_tx, current_timestamp, on_transfer}) => {
                             clock_rx_tx.send(device_server.get_realtime_clock_receiver());
-                            device_server.receive_to_external_buffer(channels, start_time_rx, current_timestamp).await;
+                            device_server.receive_to_external_buffer(channels, start_time_rx, current_timestamp, on_transfer).await;
                             println!("started receiver");
                         },
-                        Command::StartTransmitter(StartArgs{channels, start_time_rx, clock_rx_tx, current_timestamp}) => {
+                        Command::StartTransmitter(StartArgs{channels, start_time_rx, clock_rx_tx, current_timestamp, on_transfer}) => {
                             clock_rx_tx.send(device_server.get_realtime_clock_receiver());
-                            device_server.transmit_from_external_buffer(channels, start_time_rx, current_timestamp).await;
+                            device_server.transmit_from_external_buffer(channels, start_time_rx, current_timestamp, on_transfer).await;
                             println!("started transmitter");
                         },
                         Command::StopReceiver => {
@@ -126,6 +129,8 @@ struct MyIOPlug {
     start_time: Option<usize>,
     start_time_tx: Option<oneshot::Sender<u64>>,
     current_timestamp: Arc<AtomicUsize>,
+    on_transfer_eventfd: libc::c_int,
+    on_transfer: Box<dyn Fn() + Send + Sync>,
     // TODO refactor multiple Options to single Option<struct>
 }
 
@@ -146,7 +151,7 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         cur.wrapping_sub(this.start_time.unwrap()) as isize
     } else {
         //println!("using own clock");
-        // ... but fall back to system clock when not transmitting/receiving
+        // ... but fall back to system clock when not transmitting/receiving right now
         if let Some(clock_receiver) = &mut this.clock_receiver {
             if clock_receiver.update() {
                 if let Some(overlay) = clock_receiver.get() {
@@ -255,7 +260,8 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         let args = StartArgs {
             channels: channels_buffers, 
             start_time_rx, clock_rx_tx, 
-            current_timestamp: this.current_timestamp.clone()
+            current_timestamp: this.current_timestamp.clone(),
+            on_transfer: Box::new(this.on_transfer.as_ref().clone()),
         };
         match (*io).stream {  
             SND_PCM_STREAM_CAPTURE => {
@@ -355,7 +361,19 @@ unsafe extern "C" fn plugin_transfer(io: *mut snd_pcm_ioplug_t, areas: *const sn
 
 unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
     println!("plugin_close called");
-
+    let this = get_private(io);
+    {
+        let mut common_guard = inferno_global.lock();
+        let common_opt = common_guard.as_mut().unwrap();
+        // TODO blocking_send inside mutex, risk of deadlock?
+        if let Some(common) = common_opt.as_mut() {
+            if (!common.capturing) && (!common.playing) {
+                common.commands_sender.blocking_send(Command::Shutdown).unwrap();
+            }
+        }
+    }
+    libc::close(this.on_transfer_eventfd); // TODO: shouldn't this be in a different place?
+    
     0
 }
 
@@ -385,6 +403,10 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
         start_time: None,
         start_time_tx: None,
         current_timestamp: Arc::new(AtomicUsize::new(usize::MAX)),
+        on_transfer_eventfd: efd,
+        on_transfer: Box::new(move || {
+            libc::write(efd, [1u64].as_ptr() as *const c_void, 8);
+        }),
     }));
 
     let io = &mut (*myio).io;
@@ -392,8 +414,12 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
     io.name = PLUGIN_NAME.as_ptr() as *const _;
     io.callback = &(*myio).callbacks;
     io.mmap_rw = 1;
+
+    // despite ALSA PCM plugin documentation saying that poll_fd is optional,
+    // SoX actually requires it, misbehaving if not notified about transfers
     io.poll_events = POLLIN as u32;
     io.poll_fd = efd;
+
     io.private_data = myio as *mut _;
 
     let r = snd_pcm_ioplug_create(io, name, stream, mode);
@@ -444,15 +470,6 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
 
     *pcmp = (*myio).io.pcm;
 
-    // XXX just a PoC
-    // necessary to wake misbehaving processes often enough (e.g. sox)
-    // FIXME do it properly
-    std::thread::spawn(move || {
-        loop {
-            libc::write(efd, [1u64].as_ptr() as *const c_void, 8);
-            sleep(Duration::from_millis(10));
-        }
-    });
     println!("plugin_define end");
     0
 }

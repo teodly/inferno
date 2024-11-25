@@ -21,7 +21,7 @@ pub trait ProxyToBuffer<T> {
 pub trait ProxyToSamplesBuffer: ProxyToBuffer<Atomic<Sample>> {
 }
 
-/// A buffer which owns its data, stored as a `Vec``
+/// A buffer which owns its data, stored as a `Vec`
 pub struct OwnedBuffer<T>(pub Vec<T>);
 
 impl<T: Default> OwnedBuffer<T> {
@@ -161,6 +161,12 @@ pub struct RBInput<T, P: ProxyToBuffer<Atomic<T>>> {
 }
 
 impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
+  pub fn ring_buffer_size(&self) -> usize {
+    self.rb.items_size
+  }
+  pub fn has_same_ring_buffer(&self, other: &RBInput<T, P>) -> bool {
+    Arc::ptr_eq(&self.rb, &other.rb)
+  }
   pub fn write_from_at(&mut self, start_timestamp: usize, mut input: impl ExactSizeIterator<Item = T>) {
     let input_len = input.len();
     assert!(input_len < self.rb.items_size);
