@@ -18,10 +18,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{sleep, JoinHandle};
 use std::time::{Duration, Instant};
 
+struct StartArgs {
+    channels: Vec<ExternalBufferParameters<Sample>>,
+    start_time_rx: oneshot::Receiver<u64>,
+    clock_rx_tx: oneshot::Sender<RealTimeClockReceiver>,
+    current_timestamp: Arc<AtomicUsize>,
+}
 
 enum Command {
-    Receive(Vec<ExternalBufferParameters<Sample>>, oneshot::Receiver<u64>, oneshot::Sender<RealTimeClockReceiver>, Arc<AtomicUsize>),
-    Transmit(Vec<ExternalBufferParameters<Sample>>, oneshot::Receiver<u64>, oneshot::Sender<RealTimeClockReceiver>, Arc<AtomicUsize>),
+    StartReceiver(StartArgs),
+    StartTransmitter(StartArgs),
     StopReceiver,
     StopTransmitter,
     Shutdown,
@@ -65,13 +71,13 @@ fn init_common(self_info: DeviceInfo) {
             loop {
                 match commands_rx.recv().await {
                     Some(command) => match command {
-                        Command::Receive(channels, start_time_rx, clock_tx, current_timestamp) => {
-                            clock_tx.send(device_server.get_realtime_clock_receiver());
+                        Command::StartReceiver(StartArgs{channels, start_time_rx, clock_rx_tx, current_timestamp}) => {
+                            clock_rx_tx.send(device_server.get_realtime_clock_receiver());
                             device_server.receive_to_external_buffer(channels, start_time_rx, current_timestamp).await;
                             println!("started receiver");
                         },
-                        Command::Transmit(channels, start_time_rx, clock_tx, current_timestamp) => {
-                            clock_tx.send(device_server.get_realtime_clock_receiver());
+                        Command::StartTransmitter(StartArgs{channels, start_time_rx, clock_rx_tx, current_timestamp}) => {
+                            clock_rx_tx.send(device_server.get_realtime_clock_receiver());
                             device_server.transmit_from_external_buffer(channels, start_time_rx, current_timestamp).await;
                             println!("started transmitter");
                         },
@@ -238,7 +244,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     this.start_time = None;
 
     let (start_time_tx, start_time_rx) = oneshot::channel::<u64>();
-    let (clock_tx, clock_rx) = oneshot::channel::<RealTimeClockReceiver>();
+    let (clock_rx_tx, clock_rx_rx) = oneshot::channel::<RealTimeClockReceiver>();
 
     init_common(this.self_info.clone());
     {
@@ -246,20 +252,25 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         let common = common_guard.as_mut().unwrap().as_mut().unwrap();
         this.start_time_tx = None;
         this.current_timestamp.store(usize::MAX, Ordering::SeqCst);
-        match (*io).stream {
+        let args = StartArgs {
+            channels: channels_buffers, 
+            start_time_rx, clock_rx_tx, 
+            current_timestamp: this.current_timestamp.clone()
+        };
+        match (*io).stream {  
             SND_PCM_STREAM_CAPTURE => {
                 if common.capturing {
                     common.commands_sender.blocking_send(Command::StopReceiver).unwrap();
                 }
                 common.capturing = true;
-                common.commands_sender.blocking_send(Command::Receive(channels_buffers, start_time_rx, clock_tx, this.current_timestamp.clone())).unwrap();
+                common.commands_sender.blocking_send(Command::StartReceiver(args)).unwrap();
             },
             SND_PCM_STREAM_PLAYBACK => {
                 if common.playing {
                     common.commands_sender.blocking_send(Command::StopTransmitter).unwrap();
                 }
                 common.playing = true;
-                common.commands_sender.blocking_send(Command::Transmit(channels_buffers, start_time_rx, clock_tx, this.current_timestamp.clone())).unwrap();
+                common.commands_sender.blocking_send(Command::StartTransmitter(args)).unwrap();
             },
             _ => {
                 panic!("unknown stream direction");
@@ -267,7 +278,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
         }
     }
 
-    this.clock_receiver = Some(clock_rx.blocking_recv().expect("no clocks available"));
+    this.clock_receiver = Some(clock_rx_rx.blocking_recv().expect("no clocks available"));
     this.start_time_tx = Some(start_time_tx);
     if let Some(clock_receiver) = &mut this.clock_receiver {
         if let Some(overlay) = clock_receiver.get() {
