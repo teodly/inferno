@@ -8,8 +8,9 @@ fi
 
 num_channels=$1
 output_dir="${2:-.}"
-output_file="$output_dir/$(date +'%Y-%m-%d_%H-%M-%S').w64"
-fifo=./output.raw
+date_str="$(date +'%Y-%m-%d_%H-%M-%S')"
+output_file="$output_dir/$date_str.w64"
+fifo="./output.$date_str.raw"
 srate=${sample_rate:-48000}
 
 test -p $fifo || mkfifo $fifo

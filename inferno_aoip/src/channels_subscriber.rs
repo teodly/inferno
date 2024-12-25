@@ -1,4 +1,4 @@
-use crate::net_utils::create_mio_udp_socket;
+use crate::net_utils::{create_mio_udp_socket, MAX_PAYLOAD_BYTES};
 use crate::samples_collector::SamplesCollector;
 use crate::state_storage::StateStorage;
 use crate::MediaClock;
@@ -701,14 +701,15 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
                 return None;
               }
             };
-            // TODO what if fpp * tx_channels.len() * bits_per_sample/8 + overhead > MTU ?
+            
+            let fpp_mtu_limit = (MAX_PAYLOAD_BYTES / (tx_channels.len() * (first.bits_per_sample as usize)/8)).min(u16::MAX as usize) as u16;
             let handle = match control_client
               .request_flow(
                 &first.addr,
                 first.dbcp1,
                 sample_rate,
                 first.bits_per_sample,
-                first.fpp_max, // TODO fpp selection, here we use max for lowest overhead
+                first.fpp_max.min(fpp_mtu_limit), // TODO fpp selection, here we use max for lowest overhead
                 &tx_channels,
                 port,
                 &flow_name,

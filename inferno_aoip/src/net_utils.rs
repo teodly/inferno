@@ -8,6 +8,7 @@ use tokio::{net::UdpSocket, select, sync::broadcast::Receiver, time::sleep};
 
 pub const MTU: usize = 1500;
 const PACKET_BUFFER_SIZE: usize = MTU;
+pub const MAX_PAYLOAD_BYTES: usize = 1400; // ???
 
 pub struct UdpSocketWrapper {
   socket: Option<UdpSocket>,

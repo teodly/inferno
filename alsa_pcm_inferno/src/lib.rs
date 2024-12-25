@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 use std::borrow::BorrowMut;
 use std::collections::VecDeque;
 use std::env;
+use std::num::Wrapping;
 use std::ptr::{null_mut, null};
 use std::mem::zeroed;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -114,6 +115,7 @@ fn init_common(self_info: DeviceInfo) {
 
 struct StreamInfo {
     boundary: snd_pcm_uframes_t,
+    boundary_add: Wrapping<snd_pcm_sframes_t>,
 }
 
 #[repr(C)]
@@ -144,11 +146,11 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
 
     // TODO may be non-monotonic in edge cases (switching between clocks)
     // TODO rethink int sizes here
-    let ptr: isize = if this.start_time.is_some() && (cur != usize::MAX) {
+    let mut ptr: snd_pcm_sframes_t = if this.start_time.is_some() && (cur != usize::MAX) {
         //println!("using current_timestamp: {cur}");
         // It is important to use actual input/output clock here because sample precision is required.
         // Otherwise app may overwrite not-yet-sent samples or read not-yet-received ones.
-        cur.wrapping_sub(this.start_time.unwrap()) as isize
+        cur.wrapping_sub(this.start_time.unwrap()) as snd_pcm_sframes_t
     } else {
         //println!("using own clock");
         // ... but fall back to system clock when not transmitting/receiving right now
@@ -166,7 +168,7 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
             this.start_time_tx.take().unwrap().send(now_samples_opt.unwrap()).expect("failed to send start timestamp");
         }
         if now_samples_opt.is_some() && this.start_time.is_some() {
-            (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap()) as isize
+            (now_samples_opt.unwrap() as usize).wrapping_sub(this.start_time.unwrap()) as snd_pcm_sframes_t
         } else {
             0
         }
@@ -174,24 +176,29 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     };
     
     let (dir, buffered) = match (*io).stream {
-        SND_PCM_STREAM_CAPTURE => ("capture", ptr.wrapping_sub((*io).appl_ptr as isize)),
-        SND_PCM_STREAM_PLAYBACK => ("playback", ((*io).appl_ptr as isize).wrapping_sub(ptr)),
+        SND_PCM_STREAM_CAPTURE => ("capture", ptr.wrapping_sub((*io).appl_ptr as snd_pcm_sframes_t)),
+        SND_PCM_STREAM_PLAYBACK => ("playback", ((*io).appl_ptr as snd_pcm_sframes_t).wrapping_sub(ptr)),
         _ => ("???", 0)
     };
 
-    /* if buffered < 0 && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING) {
+    if buffered < 0 && ((*io).state == SND_PCM_STATE_RUNNING || (*io).state == SND_PCM_STATE_DRAINING) {
         let ioplug_avail = snd_pcm_ioplug_avail(io, ptr.try_into().unwrap(), (*io).appl_ptr);
         let ioplug_hw_avail = snd_pcm_ioplug_hw_avail(io, ptr.try_into().unwrap(), (*io).appl_ptr);
         println!("buffered for {dir}: {buffered} samples, avail {ioplug_avail}, hw_avail {ioplug_hw_avail}");
         
-        //return (-EPIPE).try_into().unwrap(); // report xrun
+        return (-EPIPE).try_into().unwrap(); // report xrun
         // TODO check for xruns in ExternalRingBuffer because this function may be called too seldom
         // FIXME we're restarting the whole transmitter/receiver on xrun which results in a LONG break, unacceptable!
-    } */
-    // TODO boundary for buffered
-    let r = (ptr % (this.stream_info.as_ref().unwrap().boundary as isize)) as snd_pcm_sframes_t;
-    //println!("ptr: {} -> {}", ptr, r);
-    r
+    }
+    
+    let boundary: snd_pcm_sframes_t = this.stream_info.as_ref().unwrap().boundary.try_into().unwrap();
+    ptr = ptr.wrapping_add(this.stream_info.as_mut().unwrap().boundary_add.0);
+    if ptr > boundary {
+        this.stream_info.as_mut().unwrap().boundary_add -= boundary;
+        ptr -= boundary;
+    }
+
+    ptr
 }
 
 fn get_app_name() -> Option<String> {
@@ -244,7 +251,8 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     assert!(boundary != 0);
     println!("boundary: {boundary}");
     this.stream_info = Some(StreamInfo {
-        boundary // TODO use this
+        boundary,
+        boundary_add: Wrapping(0),
     });
     this.start_time = None;
 
@@ -453,12 +461,25 @@ unsafe extern "C" fn plugin_define(pcmp: *mut *mut snd_pcm_t, name: *const c_cha
         panic!("snd_pcm_ioplug_set_param_list SND_PCM_IOPLUG_HW_CHANNELS returned {r}");
     }
 
-    let r = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIOD_BYTES as i32, num_channels*4*64, num_channels*4*16384);
+    let min_samples = 64; // must be power of 2
+    let max_samples = 16384;
+    let bytes_per_sample = 4;
+
+    let r = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIOD_BYTES as i32, num_channels*bytes_per_sample*min_samples, num_channels*bytes_per_sample*max_samples);
     if r < 0 {
         panic!("snd_pcm_ioplug_set_param_minmax SND_PCM_IOPLUG_HW_PERIOD_BYTES returned {r}");
     }
 
-    let r = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_BUFFER_BYTES as i32, num_channels*4*64, num_channels*4*16384);
+    let buffer_sizes: Vec<std::os::raw::c_uint> = core::iter::successors(Some(min_samples), |n| {
+        let r = n*2;
+        if r > max_samples {
+            None
+        } else {
+            Some(r)
+        }
+    }).map(|n| (num_channels*bytes_per_sample*n) as std::os::raw::c_uint).collect();
+
+    let r = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_BUFFER_BYTES as i32, buffer_sizes.len() as std::os::raw::c_uint, buffer_sizes.as_ptr());
     if r < 0 {
         panic!("snd_pcm_ioplug_set_param_minmax SND_PCM_IOPLUG_HW_BUFFER_BYTES returned {r}");
     }

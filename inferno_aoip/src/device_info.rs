@@ -16,8 +16,8 @@ pub struct DeviceInfo {
   pub factory_device_id: [u8; 8],
   pub process_id: u16,
   pub vendor_string: String,
-  pub friendly_hostname: String, // TODO limit length, otherwise DC ignores the device
-  pub factory_hostname: String,
+  pub friendly_hostname: String, // TODO limit length to 31, otherwise DC ignores the device
+  pub factory_hostname: String, // TODO as above
   pub rx_channels: Vec<Channel>,
   pub tx_channels: Vec<Channel>,
   pub bits_per_sample: u8,
