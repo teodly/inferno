@@ -159,8 +159,8 @@ impl MdnsClient {
             }
           },
           channel_in_bundle: match value.parse::<usize>() {
-            Ok(v) => v,
-            Err(_e) => {
+            Ok(v) if v>0 => v-1,
+            _ => {
               error!("Unable to parse multicast bundle value {value}");
               break;
             }

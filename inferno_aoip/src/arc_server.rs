@@ -157,7 +157,6 @@ pub async fn run_server(
           trace!("returning {in_this_response} rx channels starting with index {start_index}");
           let mut response = ByteBuffer::new();
           response.set_endian(Endian::BigEndian);
-          //response.write_u8(self_info.rx_channels.len() as u8); // total number of channels(?)
           response.write_u8(in_this_response as u8);
           response.write_u8(in_this_response as u8); // number of channels in this response(?)
           let common_descr_offset = HEADER_LENGTH + 2 + in_this_response * 20;
@@ -338,6 +337,9 @@ pub async fn run_server(
         }
         0x2200 => {
           // Destinations of this device's Transmitters
+          let content = request.content();
+          let start_index = make_u16(content[2], content[3]) as usize - 1;
+          
         }
 
         0x2201 => {

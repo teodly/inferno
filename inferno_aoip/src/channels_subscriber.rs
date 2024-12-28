@@ -47,7 +47,14 @@ pub enum SubscriptionStatus {
   InProgress = 8,
   TooManyTxFlows = 0x14, // TODO propagate error from tx's reply
   TxFail = 0x15,
-  Receiving = 0x01010009,
+  ReceivingUnicast = 0x01010009,
+  ReceivingMulticast = 0x0101000a,
+}
+
+impl SubscriptionStatus {
+  pub fn is_receiving(&self) -> bool {
+    *self == Self::ReceivingUnicast || *self == Self::ReceivingMulticast
+  }
 }
 
 #[derive(Clone, Debug)]
@@ -626,7 +633,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
                         local_channel_indices: channel_index_aliases[lci].clone(),
                         remote: ChannelOtherEnd {
                           local_flow_index: flow_index,
-                          channel_in_flow: advch.multicast.as_ref().unwrap().channel_in_bundle-1,
+                          channel_in_flow: advch.multicast.as_ref().unwrap().channel_in_bundle,
                           tx_channel_id: advch.tx_channel_id,
                         },
                       }
@@ -711,6 +718,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
       }
 
       // Create flows for multicast receivers:
+      // TODO make DC display warning when removing multicast flow from the transmitter
       for (bundle_full_name, advbundle) in &bundles {
         let socket = match mio::net::UdpSocket::bind(advbundle.media_addr) {
           Ok(socket) => socket,
@@ -735,7 +743,6 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
           }
         };
         let flow_id = flow_index + 1;
-        let flow_name = format!("{}_{}", self.self_info.process_id, flow_id);
         let source = FlowSource::Multicast(MulticastFlow {
           bundle_full_name: bundle_full_name.clone(),
         });
@@ -749,7 +756,6 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
           self.ref_instant.elapsed().as_secs() as _,
         );
         let time_arc = flow.last_packet_time.clone();
-        let tx_channels = flow.tx_channels.clone();
         flows_locked[flow_index] = Some(flow);
         let flows_recv = self.flows_recv.clone();
         let media_addr = advbundle.media_addr;
@@ -759,7 +765,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
             local_channel_indices: channel_index_aliases[lci].clone(),
             remote: ChannelOtherEnd {
               local_flow_index: flow_index,
-              channel_in_flow: advch.multicast.as_ref().unwrap().channel_in_bundle-1,
+              channel_in_flow: advch.multicast.as_ref().unwrap().channel_in_bundle,
               tx_channel_id: advch.tx_channel_id,
             },
           }
@@ -1025,13 +1031,17 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
                         } else if receiving {
                           if let Some(subi) = self.subscriptions_info.write().unwrap()[chi].as_mut()
                           {
-                            if subi.status != SubscriptionStatus::Receiving {
+                            let (status, desc) = match flow.source {
+                              FlowSource::Unicast(_) => (SubscriptionStatus::ReceivingUnicast, "unicast"),
+                              FlowSource::Multicast(_) => (SubscriptionStatus::ReceivingMulticast, "multicast"),
+                            };
+                            if subi.status != status {
                               info!(
-                                "channel index={chi}, flow index={flow_index} is receiving data"
+                                "channel index={chi}, flow index={flow_index} is receiving data ({desc})"
                               );
                               channels_changed.push(chi);
                             }
-                            subi.status = SubscriptionStatus::Receiving;
+                            subi.status = status;
                             //flow.needs_subscription_info_update = false;
                             // for now assume that we always need updating
                             // TODO figure it out with aliases
