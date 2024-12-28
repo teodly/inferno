@@ -1,10 +1,6 @@
 use crate::common::*;
 use std::{
-  collections::BTreeMap,
-  error::Error,
-  io,
-  net::{Ipv4Addr, SocketAddr},
-  str::{self},
+  collections::BTreeMap, error::Error, io, iter::Map, net::{Ipv4Addr, SocketAddr, SocketAddrV4}, str::{self}
 };
 
 use searchfire::{
@@ -26,8 +22,19 @@ pub struct AdvertisedService {
 
 #[derive(Debug, Clone)]
 pub struct PointerToMulticast {
+  pub tx_hostname: String,
   pub bundle_id: usize,
   pub channel_in_bundle: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdvertisedBundle {
+  pub tx_channels_per_flow: usize,
+  pub tx_channel_id: u16,
+  pub bits_per_sample: u32,
+  pub fpp: u16,
+  pub min_rx_latency_ns: usize,
+  pub media_addr: SocketAddr,
 }
 
 #[derive(Debug, Clone)]
@@ -109,35 +116,41 @@ impl MdnsClient {
     return Err(Box::new(io::Error::from(io::ErrorKind::NotFound)));
   }
 
-  pub async fn query_chan(&self, full_name: &str) -> Result<AdvertisedChannel, Box<dyn Error>> {
-    let fqdn = [full_name, "_netaudio-chan", "_udp", "local"];
-    let result = self.query(&fqdn).await?;
-    let parse_int = |key| -> Result<usize, Box<dyn Error>> {
-      match result.properties.get(key) {
-        Some(s) => {
-          let result = if s.starts_with("0x") {
-            usize::from_str_radix(&s[2..], 16)
-          } else {
-            s.parse::<usize>()
-          };
-          match result {
-            Ok(v) => Ok(v),
-            Err(e) => {
-              error!("unable to parse {key}={s}");
-              return Err(Box::new(e));
-            }
+  fn parse_int_from_dict(dict: &BTreeMap<String, String>, key: &str) -> Result<usize, Box<dyn Error>> {
+    match dict.get(key) {
+      Some(s) => {
+        let result = if s.starts_with("0x") {
+          usize::from_str_radix(&s[2..], 16)
+        } else {
+          s.parse::<usize>()
+        };
+        match result {
+          Ok(v) => Ok(v),
+          Err(e) => {
+            error!("unable to parse {key}={s}");
+            return Err(Box::new(e));
           }
         }
-        None => {
-          error!("{key} not found in dns response");
-          return Err(Box::new(io::Error::from(io::ErrorKind::NotFound)));
-        }
       }
+      None => {
+        error!("{key} not found in dns response");
+        return Err(Box::new(io::Error::from(io::ErrorKind::NotFound)));
+      }
+    }
+  }
+
+  pub async fn query_chan(&self, tx_hostname: &str, tx_channel_name: &str) -> Result<AdvertisedChannel, Box<dyn Error>> {
+    let full_name = format!("{}@{}", tx_channel_name, tx_hostname);
+    let fqdn = [&full_name, "_netaudio-chan", "_udp", "local"];
+    let result = self.query(&fqdn).await?;
+    let parse_int = |key| -> Result<usize, Box<dyn Error>> {
+      Self::parse_int_from_dict(&result.properties, key)
     };
     let mut multicast = None;
     for (key, value) in &result.properties {
       if key.starts_with("b.") {
         multicast = Some(PointerToMulticast {
+          tx_hostname: tx_hostname.to_owned(),
           bundle_id: match key[2..].parse::<usize>() {
             Ok(v) => v,
             Err(_e) => {
@@ -161,12 +174,31 @@ impl MdnsClient {
       addr: result.addr,
       tx_channels_per_flow: parse_int("nchan")?,
       tx_channel_id: parse_int("id")? as u16,
-      bits_per_sample: parse_int("enc").or(parse_int("en"))? as u32,
+      bits_per_sample: parse_int("enc").or_else(|_| parse_int("en"))? as u32,
       dbcp1: parse_int("dbcp1")? as u16,
       fpp_min: fpp2.parse()?,
       fpp_max: fpp1.parse()?,
       min_rx_latency_ns: parse_int("latency_ns")?,
       multicast,
+    });
+  }
+
+  pub async fn query_bund(&self, full_name: &str) -> Result<AdvertisedBundle, Box<dyn Error>> {
+    let fqdn = [full_name, "_netaudio-bund", "_udp", "local"];
+    let result = self.query(&fqdn).await?;
+    let parse_int = |key| -> Result<usize, Box<dyn Error>> {
+      Self::parse_int_from_dict(&result.properties, key)
+    };
+    let ip = result.properties.get("a.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
+    let port = result.properties.get("p.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
+    let media_addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
+    return Ok(AdvertisedBundle {
+      tx_channels_per_flow: parse_int("nchan")?,
+      tx_channel_id: parse_int("id")? as u16,
+      bits_per_sample: parse_int("enc").or_else(|_| parse_int("en"))? as u32,
+      fpp: parse_int("fpp")? as u16,
+      min_rx_latency_ns: parse_int("latency_ns")?,
+      media_addr,
     });
   }
 }

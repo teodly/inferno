@@ -205,14 +205,27 @@ impl ChannelsBuffering<ExternalBuffer<Atomic<Sample>>> for ExternalBuffering {
   }
 }
 
+struct UnicastFlow {
+  control_remote_addr: SocketAddr,
+  dbcp1: u16,
+  handle: Option<FlowHandle>,
+}
+
+struct MulticastFlow {
+  bundle_full_name: String,
+}
+
+enum FlowSource {
+  Unicast(UnicastFlow),
+  Multicast(MulticastFlow)
+}
+
 struct Flow<P: ProxyToSamplesBuffer> {
   local_id: usize,
-  control_remote_addr: SocketAddr, // TODO change to enum that will include multicasts
-  handle: Option<FlowHandle>,
+  source: FlowSource,
   channels_refcount: Vec<isize>,
   channels_rb_outputs: Vec<Option<RBOutput<Sample, P>>>,
   tx_channels: Vec<Option<u16>>,
-  dbcp1: u16,
   latency_samples: usize,
   last_packet_time: Arc<AtomicUsize>,
   needs_subscription_info_update: bool,
@@ -222,10 +235,9 @@ struct Flow<P: ProxyToSamplesBuffer> {
 impl<P: ProxyToSamplesBuffer> Flow<P> {
   fn new(
     local_id: usize,
-    control_remote_addr: SocketAddr,
+    source: FlowSource,
     total_channels: usize,
     tx_channels: impl IntoIterator<Item = u16>,
-    dbcp1: u16,
     latency_samples: usize,
     now: usize,
   ) -> Self {
@@ -234,12 +246,10 @@ impl<P: ProxyToSamplesBuffer> Flow<P> {
     tx_channels.resize(total_channels, None);
     Self {
       local_id,
-      control_remote_addr,
-      handle: None,
+      source,
       channels_refcount: chs,
       channels_rb_outputs: (0..total_channels).map(|_| None).collect(),
       tx_channels,
-      dbcp1,
       latency_samples,
       last_packet_time: Arc::new(AtomicUsize::new(0)),
       needs_subscription_info_update: true,
@@ -463,11 +473,10 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
     let dns_resolve_futures =
       needed_channel_indices.iter().enumerate().map(|(i, &local_ch_index)| {
         let chsub = self.channels[local_ch_index].as_ref().unwrap();
-        let name = format!("{}@{}", chsub.tx_channel_name, chsub.tx_hostname);
         let mdns_client = self.mdns_client.clone();
         async move {
-          sleep(Duration::from_millis(20 * i as u64)).await;
-          let result = mdns_client.query_chan(&name).await;
+          sleep(Duration::from_millis(8 * i as u64)).await;
+          let result = mdns_client.query_chan(&chsub.tx_hostname, &chsub.tx_channel_name).await;
           debug!("{:?}", result);
           return (
             local_ch_index,
@@ -484,9 +493,20 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
 
     // Add all needed servers to map:
     let mut channels_per_server = BTreeMap::<SocketAddr, BTreeMap<usize, AdvertisedChannel>>::new();
+    let mut channels_per_bundle = BTreeMap::<String, BTreeMap<usize, AdvertisedChannel>>::new();
     for (lci, advserv_opt) in join_all(dns_resolve_futures).await.into_iter() {
       if let Some(advserv) = advserv_opt {
-        channels_per_server.entry(advserv.addr).or_default().insert(lci, advserv);
+        match &advserv.multicast {
+          None => {
+            channels_per_server.entry(advserv.addr).or_default().insert(lci, advserv);
+          },
+          Some(mcast) => {
+            // this channel is readily available in multicast, no need to send any requests
+            let bundle_name = format!("{}@{}", mcast.bundle_id, mcast.tx_hostname);
+            info!("using multicast for channel {} of {}", advserv.tx_channel_id, mcast.tx_hostname);
+            channels_per_bundle.entry(bundle_name).or_default().insert(lci, advserv);
+          }
+        }
       }
     }
 
@@ -505,7 +525,25 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
       channels_per_server.remove(&addr);
     }
 
-    // TODO multicast bundles
+    // TODO check sample rate so that we don't request flows from devices with incompatible sample rate
+
+    // Resolve multicast bundles:
+    let dns_resolve_futures =
+      channels_per_bundle.keys().enumerate().map(|(i, bund_full_name)| {
+        let mdns_client = self.mdns_client.clone();
+        let bund_full_name = bund_full_name.clone();
+        async move {
+          sleep(Duration::from_millis(8 * i as u64)).await;
+          let result = mdns_client.query_bund(&bund_full_name).await;
+          debug!("{:?}", result);
+          match result {
+            Ok(v) => Some((bund_full_name, v)),
+            Err(_) => None,
+          }
+        }
+        .boxed()
+      });
+    let mut bundles: BTreeMap<_, _> = join_all(dns_resolve_futures).await.into_iter().flatten().collect();
 
     let mut free_slots_per_server = BTreeMap::<SocketAddr, BTreeMap<usize, BTreeSet<usize>>>::new();
     let mut futures_per_server = BTreeMap::<SocketAddr, Vec<_>>::new();
@@ -515,61 +553,88 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
       trace!("acquired flows lock");
       for (flow_index, flow_opt) in flows_locked.iter().enumerate() {
         if let Some(flow) = flow_opt {
-          match channels_per_server.entry(flow.control_remote_addr) {
-            Entry::Vacant(_) => continue,
-            Entry::Occupied(mut channels) => {
-              // here we've found list of channels that may need this flow.
+          match &flow.source {
+            FlowSource::Unicast(uf) => {
+              match channels_per_server.entry(uf.control_remote_addr) {
+                Entry::Vacant(_) => continue,
+                Entry::Occupied(mut channels) => {
+                  // here we've found list of channels that may need this flow.
 
-              // Find if we already have needed tx channels in any flows (no requests needed):
-              // (this is needed because user may have disconnected a channel
-              //  but audio is still flowing in a flow serving different channel(s))
+                  // Find if we already have needed tx channels in any flows (no requests needed):
+                  // (this is needed because user may have disconnected a channel
+                  //  but audio is still flowing in a flow serving different channel(s))
 
-              // let's iterate over all channel we need from this server:
-              let mut updates = channels
-                .get()
-                .iter()
-                .filter_map(|(lci, advch)| {
-                  match flow
-                    .tx_channels
+                  // let's iterate over all channel we need from this server:
+                  let mut updates = channels
+                    .get()
                     .iter()
-                    .enumerate()
-                    .position(|(_, &txch)| txch == Some(advch.tx_channel_id))
-                  {
-                    None => None,
-                    Some(channel_in_flow) => Some(ChannelSourceUpdate {
-                      // here we've found a channel that we need
-                      local_channel_indices: channel_index_aliases[lci].clone(),
-                      remote: ChannelOtherEnd {
-                        local_flow_index: flow_index,
-                        channel_in_flow,
-                        tx_channel_id: advch.tx_channel_id,
-                      },
-                    }),
-                  }
-                })
-                .collect_vec();
+                    .filter_map(|(lci, advch)| {
+                      match flow
+                        .tx_channels
+                        .iter()
+                        .enumerate()
+                        .position(|(_, &txch)| txch == Some(advch.tx_channel_id))
+                      {
+                        None => None,
+                        Some(channel_in_flow) => Some(ChannelSourceUpdate {
+                          // here we've found a channel that we need
+                          local_channel_indices: channel_index_aliases[lci].clone(),
+                          remote: ChannelOtherEnd {
+                            local_flow_index: flow_index,
+                            channel_in_flow,
+                            tx_channel_id: advch.tx_channel_id,
+                          },
+                        }),
+                      }
+                    })
+                    .collect_vec();
 
-              // And prepare list of free slots in flows transmitters, we'll need them soon:
-              let free_slots = free_slots_per_server
-                .entry(flow.control_remote_addr)
-                .or_default()
-                .entry(flow_index)
-                .or_default();
-              for (channel_in_flow, &refcount) in flow.channels_refcount.iter().enumerate() {
-                if refcount <= 0 {
-                  debug_assert_eq!(refcount, 0);
-                  free_slots.insert(channel_in_flow);
+                  // And prepare list of free slots in flows transmitters, we'll need them soon:
+                  let free_slots = free_slots_per_server
+                    .entry(uf.control_remote_addr)
+                    .or_default()
+                    .entry(flow_index)
+                    .or_default();
+                  for (channel_in_flow, &refcount) in flow.channels_refcount.iter().enumerate() {
+                    if refcount <= 0 {
+                      debug_assert_eq!(refcount, 0);
+                      free_slots.insert(channel_in_flow);
+                    }
+                  }
+                  for update in &updates {
+                    // remove found channels from list of needed channels:
+                    let result = channels.get_mut().remove(&update.local_channel_indices[0]);
+                    debug_assert!(result.is_some());
+                    // and remove slots we'll use soon from the list of free slots:
+                    free_slots.remove(&update.remote.channel_in_flow);
+                  }
+                  resolved.append(&mut updates);
                 }
               }
-              for update in &updates {
-                // remove found channels from list of needed channels:
-                let result = channels.get_mut().remove(&update.local_channel_indices[0]);
-                debug_assert!(result.is_some());
-                // and remove slots we'll use soon from the list of free slots:
-                free_slots.remove(&update.remote.channel_in_flow);
+            },
+            FlowSource::Multicast(mf) => {
+              match channels_per_bundle.entry(mf.bundle_full_name.clone()) {
+                Entry::Vacant(_) => continue,
+                Entry::Occupied(channels) => {
+                  bundles.remove(&mf.bundle_full_name); // already receiving
+
+                  let mut updates = channels
+                    .get()
+                    .iter()
+                    .map(|(lci, advch)| {
+                      ChannelSourceUpdate {
+                        local_channel_indices: channel_index_aliases[lci].clone(),
+                        remote: ChannelOtherEnd {
+                          local_flow_index: flow_index,
+                          channel_in_flow: advch.multicast.as_ref().unwrap().channel_in_bundle-1,
+                          tx_channel_id: advch.tx_channel_id,
+                        },
+                      }
+                    }).collect_vec();
+                  resolved.append(&mut updates);
+                }
               }
-              resolved.append(&mut updates);
-            }
+            },
           }
         }
       }
@@ -616,29 +681,103 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
               tx_ch_updates_per_flow.into_iter().map(|(flow_index, (new_tx_channels, updates))| {
                 let control_client = self.control_client.clone();
                 let flow = flows_locked[flow_index].as_ref().unwrap();
-                let dbcp1 = flow.dbcp1;
-                let handle = flow.handle.unwrap();
-                async move {
-                  match control_client
-                    .update_flow(&server_addr, dbcp1, handle, &new_tx_channels)
-                    .await
-                  {
-                    Ok(()) => {
-                      debug!("update flow {updates:?} request success");
-                      Some(updates)
-                    }
-                    Err(e) => {
-                      error!("update flow {updates:?} request failed: {e:?}");
-                      // TODO set subscription info with the fail
-                      None
+                if let FlowSource::Unicast(uf) = &flow.source {
+                  let dbcp1 = uf.dbcp1;
+                  let handle = uf.handle.unwrap();
+                  async move {
+                    match control_client
+                      .update_flow(&server_addr, dbcp1, handle, &new_tx_channels)
+                      .await
+                    {
+                      Ok(()) => {
+                        debug!("update flow {updates:?} request success");
+                        Some(updates)
+                      }
+                      Err(e) => {
+                        error!("update flow {updates:?} request failed: {e:?}");
+                        // TODO set subscription info with the fail
+                        None
+                      }
                     }
                   }
+                  .boxed()
+                } else {
+                  panic!("unexpected non-unicast flow");
                 }
-                .boxed()
               });
             futures_per_server.insert(server_addr, futures.collect_vec());
           }
         }
+      }
+
+      // Create flows for multicast receivers:
+      for (bundle_full_name, advbundle) in &bundles {
+        let socket = match mio::net::UdpSocket::bind(advbundle.media_addr) {
+          Ok(socket) => socket,
+          Err(e) => {
+            error!("failed to bind to socket {:?} for multicast media: {e:?}", advbundle.media_addr);
+            continue;
+          }
+        };
+        let mcast_ipv4 = match advbundle.media_addr.ip() {
+          std::net::IpAddr::V4(ip) => ip,
+          _ => panic!("media multicast address is not ipv4")
+        };
+        if let Err(e) = socket.join_multicast_v4(&mcast_ipv4, &self.self_info.ip_address) {
+          error!("failed to join multicast group {:?}: {e:?}", advbundle.media_addr.ip());
+          continue;
+        };
+        let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
+          Some(i) => i,
+          None => {
+            flows_locked.push(None);
+            flows_locked.len() - 1
+          }
+        };
+        let flow_id = flow_index + 1;
+        let flow_name = format!("{}_{}", self.self_info.process_id, flow_id);
+        let source = FlowSource::Multicast(MulticastFlow {
+          bundle_full_name: bundle_full_name.clone(),
+        });
+        let needed_channels = channels_per_bundle.get(bundle_full_name).unwrap();
+        let flow = Flow::new(
+          flow_id,
+          source,
+          advbundle.tx_channels_per_flow,
+          vec![], // tx_channels aren't read in case of multicast flows, so no need to initialize
+          ((advbundle.min_rx_latency_ns as u64).max(self.min_latency_ns as u64) * (self.self_info.sample_rate as u64) / 1_000_000_000u64).try_into().unwrap(),
+          self.ref_instant.elapsed().as_secs() as _,
+        );
+        let time_arc = flow.last_packet_time.clone();
+        let tx_channels = flow.tx_channels.clone();
+        flows_locked[flow_index] = Some(flow);
+        let flows_recv = self.flows_recv.clone();
+        let media_addr = advbundle.media_addr;
+        let advbundle = advbundle.clone();
+        let updates = Some(needed_channels.iter().map(|(lci, advch)| {
+          ChannelSourceUpdate {
+            local_channel_indices: channel_index_aliases[lci].clone(),
+            remote: ChannelOtherEnd {
+              local_flow_index: flow_index,
+              channel_in_flow: advch.multicast.as_ref().unwrap().channel_in_bundle-1,
+              tx_channel_id: advch.tx_channel_id,
+            },
+          }
+        }).collect_vec());
+        let future = async move {
+          flows_recv
+            .add_socket(
+              flow_index,
+              socket,
+              false,
+              (advbundle.bits_per_sample as usize) / 8,
+              advbundle.tx_channels_per_flow,
+              time_arc,
+            )
+            .await;
+          updates
+        }.boxed();
+        futures_per_server.entry(media_addr).or_default().push(future);
       }
 
       // Create new flows for remaining channels:
@@ -659,12 +798,12 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
           let tx_channels = chunk.iter().map(|(_, chadv)| chadv.tx_channel_id);
           let flow_id = flow_index + 1;
           let flow_name = format!("{}_{}", self.self_info.process_id, flow_id);
+          let source = FlowSource::Unicast(UnicastFlow {control_remote_addr: first.addr, dbcp1: first.dbcp1, handle: None});
           let flow = Flow::new(
             flow_id,
-            first.addr,
+            source,
             first.tx_channels_per_flow.min(self.self_info.rx_channels.len()).min(8), /*TODO make it configurable*/
             tx_channels,
-            first.dbcp1,
             ((first.min_rx_latency_ns as u64).max(self.min_latency_ns as u64) * (self.self_info.sample_rate as u64) / 1_000_000_000u64).try_into().unwrap(),
             self.ref_instant.elapsed().as_secs() as _,
           );
@@ -734,12 +873,19 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
               .add_socket(
                 flow_index,
                 socket,
+                true,
                 (first.bits_per_sample as usize) / 8,
                 tx_channels.len(),
                 time_arc,
               )
               .await;
-            flows.lock().unwrap()[flow_index].as_mut().unwrap().handle = Some(handle);
+            let mut flows_locked = flows.lock().unwrap();
+            let mut source = &mut flows_locked[flow_index].as_mut().unwrap().source;
+            if let FlowSource::Unicast(uf) = &mut source {
+              uf.handle = Some(handle);
+            } else {
+              error!("BUG: unexpected non-unicast flow when trying to assign handle");
+            }
             
             return Some(updates);
           }
@@ -812,7 +958,6 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
             tx_hostname: subscription.tx_hostname.clone(),
             status: SubscriptionStatus::InProgress
           });
-          //subinfos[chi].as_mut().unwrap().status = SubscriptionStatus::InProgress;
           changed_channels.push(chi);
           // TODO probably some lines can be brought out of this loop
         }
@@ -901,21 +1046,32 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>> C
                 remove = true;
               }
               if remove {
-                let control_client = self.control_client.clone();
-                let flows_recv = self.flows_recv.clone();
-                let rem_addr = flow.control_remote_addr;
-                let dbcp1 = flow.dbcp1;
-                let handle = flow.handle.unwrap();
-                let flow_id = flow.local_id;
-                destroy_futures_per_remote.entry(flow.control_remote_addr).or_default().push(
-                  async move {
-                    info!("removing no longer needed flow index={flow_index}, remote={rem_addr:?}");
-                    control_client.stop_flow(&rem_addr, dbcp1, handle).await.log_and_forget();
-                    // we can safely ignore errors - we remove the socket so keepalive messages won't arrive to the tx so it'll kick us off anyway
-                    flows_recv.remove_socket(flow_index).await;
-                  }
-                  .boxed(),
-                );
+                match &flow.source {
+                  FlowSource::Unicast(uf) => {
+                    let control_client = self.control_client.clone();
+                    let flows_recv = self.flows_recv.clone();
+                    let rem_addr = uf.control_remote_addr;
+                    let dbcp1 = uf.dbcp1;
+                    let handle = uf.handle.unwrap();
+                    let flow_id = flow.local_id;
+                    destroy_futures_per_remote.entry(uf.control_remote_addr).or_default().push(
+                      async move {
+                        info!("removing no longer needed flow index={flow_index}, remote={rem_addr:?}");
+                        control_client.stop_flow(&rem_addr, dbcp1, handle).await.log_and_forget();
+                        // we can safely ignore errors - we remove the socket so keepalive messages won't arrive to the tx so it'll kick us off anyway
+                        flows_recv.remove_socket(flow_index).await;
+                      }
+                      .boxed(),
+                    );
+                  },
+                  FlowSource::Multicast(mf) => {
+                    let flows_recv = self.flows_recv.clone();
+                    tokio::spawn(async move {
+                      flows_recv.remove_socket(flow_index).await;
+                    });
+                  },
+                }
+
                 Some(flow_index)
               } else {
                 None

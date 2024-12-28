@@ -43,6 +43,7 @@ struct Channel<P: ProxyToSamplesBuffer> {
 
 struct SocketData<P: ProxyToSamplesBuffer> {
   socket: UdpSocket,
+  send_keepalives: bool,
   last_source: Option<SocketAddr>,
   last_packet_time: Arc<AtomicUsize>, // timebase: seconds since ref_instant
   bytes_per_sample: usize,
@@ -92,6 +93,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           if write {
             let num_channels = sd.channels.len();
             sd.last_packet_time.store(ref_instant.elapsed().as_secs() as _, Ordering::Relaxed);
+            
 
             let _total_num_samples = (recv_size - 9) / sd.bytes_per_sample;
             //let audio_bytes = &buf[9..9+total_num_samples*sd.bytes_per_sample];
@@ -211,15 +213,15 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         match self.commands_receiver.try_recv() {
           Ok(command) => match command {
             Command::Shutdown => break,
-            Command::AddSocket { index: id, mut socket } => {
+            Command::AddSocket { index, mut socket } => {
               debug!("adding socket");
-              self.poll.registry().register(&mut socket.socket, mio::Token(id), mio::Interest::READABLE).unwrap();
-              let previous = std::mem::replace(&mut self.sockets[id], Some(socket));
+              self.poll.registry().register(&mut socket.socket, mio::Token(index), mio::Interest::READABLE).unwrap();
+              let previous = std::mem::replace(&mut self.sockets[index], Some(socket));
               debug_assert!(previous.is_none());
             }
-            Command::RemoveSocket { index: id } => {
-              self.poll.registry().deregister(&mut self.sockets[id].as_mut().unwrap().socket).unwrap();
-              let channels = self.sockets[id].take().unwrap().channels;
+            Command::RemoveSocket { index } => {
+              self.poll.registry().deregister(&mut self.sockets[index].as_mut().unwrap().socket).unwrap();
+              let channels = self.sockets[index].take().unwrap().channels;
               if let Some(now) = self.clock.now_in_timebase(self.sample_rate as u64) {
                 channels.into_iter().flatten().for_each(|ch| {
                   let rb_size = ch.sink.ring_buffer_size();
@@ -231,15 +233,15 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                 warn!("no media clock, unable to initialize SilenceWriter")
               }
             }
-            Command::ConnectChannel { socket_index: socket_id, channel_index, sink, latency_samples } => {
-              self.sockets[socket_id].as_mut().unwrap().channels[channel_index] = Some(Channel {
+            Command::ConnectChannel { socket_index, channel_index, sink, latency_samples } => {
+              self.sockets[socket_index].as_mut().unwrap().channels[channel_index] = Some(Channel {
                 sink,
                 latency_samples,
                 timestamp_shift: start_timestamp.map(|start_ts| 0i64.wrapping_sub_unsigned(start_ts).wrapping_add_unsigned(latency_samples.try_into().unwrap())).unwrap_or(0)
               });
             }
-            Command::DisconnectChannel { socket_index: socket_id, channel_index } => {
-              self.sockets[socket_id].as_mut().unwrap().channels[channel_index] = None;
+            Command::DisconnectChannel { socket_index, channel_index } => {
+              self.sockets[socket_index].as_mut().unwrap().channels[channel_index] = None;
             }
             Command::NoOp => {}
           }
@@ -254,7 +256,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
       
       let now = Instant::now();
       if now >= next_keepalive {
-        for sd in self.sockets.iter().filter_map(|opt|opt.as_ref()) {
+        for sd in self.sockets.iter().filter_map(|opt|opt.as_ref()).filter(|sd|sd.send_keepalives) {
           if let Some(src) = sd.last_source {
             if let Err(e) = sd.socket.send_to(&KEEPALIVE_CONTENT, src) {
               error!("failed to send keepalive to {src:?}: {e:?}");
@@ -315,6 +317,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
     &self,
     local_index: usize,
     socket: UdpSocket,
+    send_keepalives: bool,
     bytes_per_sample: usize,
     channels_count: usize,
     last_packet_time_arc: Arc<AtomicUsize>,
@@ -326,6 +329,7 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
         index: local_index,
         socket: SocketData {
           socket,
+          send_keepalives,
           last_source: None,
           last_packet_time: last_packet_time_arc,
           bytes_per_sample,
