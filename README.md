@@ -22,13 +22,13 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 | Route audio using Dante Controller patchbay | ✅ Yes! | ✅ Yes | 🚫 AES67->Dante only |
 | Configurable using Dante Controller | ⏳ Mostly not yet | ✅ Yes | 🚫 No |
 | Compatible with Dante Domain Manager | 🚫 No | ✅ Yes | 🚫 No (but AES67 integration possible) |
-| Supported clock protocols | PTPv2 ☑️, ⏳ [PTPv1](https://github.com/teodly/statime/tree/ptpv1-hack) soon 💣 | PTPv1 ✅ | PTPv2 ✅ |
+| Supported clock protocols | [PTPv1](https://github.com/teodly/statime/tree/inferno-dev) ☑️, PTPv2 ☑️ | PTPv1 ✅ | PTPv2 ✅ |
 | Clock leader | PTPv2 ☑️ via [Statime](https://github.com/pendulum-project/statime) | 🚫 No (but possible in Dante Via) | ☑️ via external daemon |
 | Stream audio from/to modern Dante hardware | ✅ Yes | ✅ Yes | ✅ Yes |
 | Stream audio from/to DVS, Dante Via & old Dante hardware | ✅ Yes | ✅ Yes | 🚫 No  |
 | Stream audio from/to AES67           | 🚫 No  | 🚫 No  | ✅ Yes |
 | Minimum latency | as low as your kernel gets | 4ms | ... | 
-| Sends & receives multicasts | ⏳ Not yet | ✅ Yes | ✅ Yes |
+| Sends & receives multicasts | ⏳ Receives | ✅ Yes | ✅ Yes |
 | OS integration | Entirely user-space | Kernel driver & user-space services | Kernel driver & user-space helper |
 | Lightweight recording app | ✅ Yes (Inferno2pipe) | 🚫 No | ☑️ FFmpeg with RTP input does the trick |
 | Disk space & RAM usage | 🌱 Low (~12MB RAM) | 🔥 High | 🌱 Low |
@@ -61,15 +61,15 @@ This project makes no claim to be either authorized or approved by Audinate.
 # Quick start
 1. [Install Rust](https://rustup.rs/)
 2. If wanting to use anything other than Inferno2pipe, clock synchronization daemon is needed. Inferno is compatible with modified [Statime](https://github.com/pendulum-project/statime):
-   * Enable AES67 in at least 1 device in the network. Otherwise Statime which is PTPv2-only won't be able to get timestamps from PTPv1 used by Dante. It will be fixed soon - [a workaround exists](https://github.com/teodly/statime/tree/ptpv1-hack) but wasn't merged yet with other changes.
    * `git clone -b inferno-dev https://github.com/teodly/statime`
    * `cd statime && cargo build`
-   * `sudo target/debug/statime -c inferno-ptpv2.toml`
+   * adjust network interface in `inferno-ptpv1.toml`
+   * `sudo target/debug/statime -c inferno-ptpv1.toml`
 3. Clone this repo with `--recursive` option (some dependencies are in submodules)
 4. `cd` to the desired program/library directory
    * simple command line audio recorder: [`Inferno2pipe`](inferno2pipe/README.md)
    * virtual soundcard for ALSA: [`alsa_pcm_inferno`](alsa_pcm_inferno/README.md) - also works with PipeWire, should work with JACK (not tested yet)
-   * virtual soundcard for PipeWire: `inferno_wired`
+   * virtual soundcard for PipeWire: `inferno_wired` (not maintained)
 5. `cargo build`
 6. Follow the instructions in README of the specific program/library
 
@@ -122,6 +122,7 @@ Please use editor respecting `.editorconfig` (for example, VSCode needs an exten
 * introduced ALSA PCM plugin - a virtual soundcard compatible with most Linux audio apps
 * receive clock using a documented protocol: [usrvclock](https://gitlab.com/lumifaza/usrvclock)
 * various internal changes primarily related to allowing the use of external buffers (needed for mmap mode in ALSA plugin)
+* receive multicasts
 
 ## 0.2.0
 * audio transmitter
