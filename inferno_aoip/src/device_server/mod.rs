@@ -2,7 +2,7 @@ use crate::mdns_client::{MdnsClient, PointerToMulticast};
 use crate::media_clock::{
   async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver,
 };
-use crate::ring_buffer::{self, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput};
+use crate::ring_buffer::{self, ProxyToBuffer, ProxyToSamplesBuffer};
 use crate::state_storage::StateStorage;
 use atomic::Atomic;
 use flows_tx::FlowsTransmitter;
@@ -42,7 +42,8 @@ pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
 pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
-pub use crate::ring_buffer::{ExternalBufferParameters, PositionReportDestination};
+pub use crate::ring_buffer::{ExternalBufferParameters, OwnedBuffer, PositionReportDestination, RBInput, RBOutput};
+pub use crate::ring_buffer::new_owned as new_owned_ring_buffer;
 pub use settings::Settings;
 pub type AtomicSample = atomic::Atomic<Sample>;
 
@@ -286,13 +287,52 @@ impl DeviceServer {
       tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
     let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
     *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, on_transfer).await;
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, None, on_transfer).await;
   }
+
+  /// Start transmitting from owned ring buffers.
+  ///
+  /// Creates `channel_count` owned ring buffers and returns the `RBInput` write handles.
+  /// The caller writes audio samples via `RBInput::write_from_at()`.
+  /// The `RBOutput` read handles are passed to the internal transmitter.
+  ///
+  /// Unlike `transmit_from_external_buffer`, owned buffers:
+  /// - Track `readable_pos` on the write side (inferno only reads validated data)
+  /// - Have `unconditional_read() == false` (reads check readable_pos)
+  /// - Support hole detection and fill via `hole_fix_wait`
+  ///
+  /// The `read_position` atomic is updated by the FlowsTransmitter with the actual
+  /// ring buffer position it reads from (`start_ts = next_ts + timestamp_shift`).
+  /// This allows external writers to align their write positions correctly.
+  pub async fn transmit_from_owned_buffer(
+    &mut self,
+    channel_count: usize,
+    buffer_length: usize,
+    hole_fix_wait: usize,
+    start_time_rx: tokio::sync::oneshot::Receiver<Clock>,
+    current_timestamp: Arc<AtomicUsize>,
+    read_position: Arc<AtomicUsize>,
+    on_transfer: Option<TransferNotifier>,
+  ) -> Vec<ring_buffer::RBInput<Sample, OwnedBuffer<Atomic<Sample>>>> {
+    let mut rb_inputs = Vec::with_capacity(channel_count);
+    let mut rb_outputs = Vec::with_capacity(channel_count);
+    for _ in 0..channel_count {
+      let (input, output) = ring_buffer::new_owned(buffer_length, 0, hole_fix_wait);
+      rb_inputs.push(input);
+      rb_outputs.push(output);
+    }
+    let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
+    *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, Some(read_position), on_transfer).await;
+    rb_inputs
+  }
+
   async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(
     &mut self,
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     rb_outputs: Vec<RBOutput<Sample, P>>,
     current_timestamp: Arc<AtomicUsize>,
+    read_position: Option<Arc<AtomicUsize>>,
     on_transfer: Option<TransferNotifier>,
   ) {
     let clock_rx = self.clock_receiver.subscribe();
@@ -305,6 +345,7 @@ impl DeviceServer {
       rb_outputs.clone(),
       start_time_rx,
       current_timestamp.clone(),
+      read_position.unwrap_or_else(|| Arc::new(AtomicUsize::new(usize::MAX))),
       on_transfer,
     );
     *self.flows_tx.lock().await = Some(flows_tx_handle);
