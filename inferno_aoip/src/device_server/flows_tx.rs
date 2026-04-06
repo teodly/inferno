@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::num::Wrapping;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
@@ -161,12 +161,8 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         let start_ts = (flow.next_ts as Clock).wrapping_add_signed(self.timestamp_shift);
         self.read_position.store(start_ts, Ordering::Release);
         if let Some(snapshot) = &self.read_position_snapshot {
-            let seq = snapshot.seq.load(Ordering::Relaxed);
-            snapshot.seq.store(seq.wrapping_add(1), Ordering::Release); // odd = writing
-            snapshot.read_position.store(start_ts, Ordering::Relaxed);
             let nanos = self.snapshot_ref_instant.elapsed().as_nanos() as u64;
-            snapshot.monotonic_nanos.store(nanos, Ordering::Relaxed);
-            snapshot.seq.store(seq.wrapping_add(2), Ordering::Release); // even = stable
+            snapshot.publish(start_ts, nanos);
         }
         for (index_in_flow, &ch_opt) in flow.channel_indices.iter().enumerate() {
           if let Some(ch_index) = ch_opt {
@@ -511,8 +507,14 @@ impl FlowsTransmitter {
         .unwrap(),
       current_timestamp,
       read_position,
-      read_position_snapshot,
-      snapshot_ref_instant: std::time::Instant::now(),
+      read_position_snapshot: read_position_snapshot.clone(),
+      snapshot_ref_instant: {
+        let now = std::time::Instant::now();
+        if let Some(snap) = &read_position_snapshot {
+          snap.init_ref_instant(now);
+        }
+        now
+      },
       on_transfer,
     };
     internal.run(start_time_rx).await;

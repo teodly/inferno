@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast as broadcast_queue, mpsc, watch, Mutex};
@@ -51,10 +51,13 @@ pub type AtomicSample = atomic::Atomic<Sample>;
 /// at the exact point it updates `read_position`. Readers use a seqlock protocol:
 /// odd seq = writer active, even seq = stable. Retry if seq changes between reads.
 pub struct ReadPositionSnapshot {
-    pub seq: AtomicUsize,
-    pub read_position: AtomicUsize,
-    /// Nanoseconds elapsed since a reference Instant stored in the TX thread.
-    pub monotonic_nanos: std::sync::atomic::AtomicU64,
+    seq: AtomicUsize,
+    read_position: AtomicUsize,
+    /// Nanoseconds elapsed since `ref_instant`.
+    monotonic_nanos: std::sync::atomic::AtomicU64,
+    /// Reference instant for monotonic_nanos. Set once by the TX thread at startup.
+    /// Readers reconstruct the snapshot instant as `ref_instant + Duration::from_nanos(monotonic_nanos)`.
+    ref_instant: OnceLock<std::time::Instant>,
 }
 
 impl ReadPositionSnapshot {
@@ -63,7 +66,48 @@ impl ReadPositionSnapshot {
             seq: AtomicUsize::new(0),
             read_position: AtomicUsize::new(usize::MAX),
             monotonic_nanos: std::sync::atomic::AtomicU64::new(0),
+            ref_instant: OnceLock::new(),
         }
+    }
+
+    pub(crate) fn init_ref_instant(&self, instant: std::time::Instant) {
+        let _ = self.ref_instant.set(instant);
+    }
+
+    pub(crate) fn publish(&self, read_position: usize, monotonic_nanos: u64) {
+        let seq = self.seq.load(std::sync::atomic::Ordering::Relaxed);
+        self.seq
+            .store(seq.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        self.read_position
+            .store(read_position, std::sync::atomic::Ordering::Relaxed);
+        self.monotonic_nanos
+            .store(monotonic_nanos, std::sync::atomic::Ordering::Relaxed);
+        self.seq
+            .store(seq.wrapping_add(2), std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn try_read(&self) -> Option<(usize, std::time::Instant)> {
+        let ref_instant = *self.ref_instant.get()?;
+        for _ in 0..8 {
+            let seq1 = self.seq.load(std::sync::atomic::Ordering::Acquire);
+            if seq1 & 1 != 0 {
+                continue;
+            }
+            let pos = self
+                .read_position
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let nanos = self
+                .monotonic_nanos
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let seq2 = self.seq.load(std::sync::atomic::Ordering::Acquire);
+            if seq1 == seq2 {
+                if pos == usize::MAX {
+                    return None;
+                }
+                return Some((pos, ref_instant + Duration::from_nanos(nanos)));
+            }
+        }
+        None
     }
 }
 
