@@ -47,6 +47,26 @@ pub use crate::ring_buffer::new_owned as new_owned_ring_buffer;
 pub use settings::Settings;
 pub type AtomicSample = atomic::Atomic<Sample>;
 
+/// Consistent (read_position, monotonic_time) snapshot written by the TX thread
+/// at the exact point it updates `read_position`. Readers use a seqlock protocol:
+/// odd seq = writer active, even seq = stable. Retry if seq changes between reads.
+pub struct ReadPositionSnapshot {
+    pub seq: AtomicUsize,
+    pub read_position: AtomicUsize,
+    /// Nanoseconds elapsed since a reference Instant stored in the TX thread.
+    pub monotonic_nanos: std::sync::atomic::AtomicU64,
+}
+
+impl ReadPositionSnapshot {
+    pub fn new() -> Self {
+        Self {
+            seq: AtomicUsize::new(0),
+            read_position: AtomicUsize::new(usize::MAX),
+            monotonic_nanos: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 use channels_subscriber::{ChannelsBuffering, ChannelsSubscriber, ExternalBuffering, OwnedBuffering};
 use peaks::peaks_of_buffers;
 use samples_collector::{RealTimeSamplesReceiver, SamplesCallback, SamplesCollector};
@@ -287,7 +307,7 @@ impl DeviceServer {
       tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
     let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
     *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, None, on_transfer).await;
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, None, None, on_transfer).await;
   }
 
   /// Start transmitting from owned ring buffers.
@@ -312,6 +332,7 @@ impl DeviceServer {
     start_time_rx: tokio::sync::oneshot::Receiver<Clock>,
     current_timestamp: Arc<AtomicUsize>,
     read_position: Arc<AtomicUsize>,
+    read_position_snapshot: Option<Arc<ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) -> Vec<ring_buffer::RBInput<Sample, OwnedBuffer<Atomic<Sample>>>> {
     let mut rb_inputs = Vec::with_capacity(channel_count);
@@ -323,7 +344,7 @@ impl DeviceServer {
     }
     let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
     *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, Some(read_position), on_transfer).await;
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, Some(read_position), read_position_snapshot, on_transfer).await;
     rb_inputs
   }
 
@@ -333,6 +354,7 @@ impl DeviceServer {
     rb_outputs: Vec<RBOutput<Sample, P>>,
     current_timestamp: Arc<AtomicUsize>,
     read_position: Option<Arc<AtomicUsize>>,
+    read_position_snapshot: Option<Arc<ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) {
     let clock_rx = self.clock_receiver.subscribe();
@@ -346,6 +368,7 @@ impl DeviceServer {
       start_time_rx,
       current_timestamp.clone(),
       read_position.unwrap_or_else(|| Arc::new(AtomicUsize::new(usize::MAX))),
+      read_position_snapshot,
       on_transfer,
     );
     *self.flows_tx.lock().await = Some(flows_tx_handle);

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::num::Wrapping;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
 use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
@@ -106,6 +106,10 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   /// The actual ring buffer position last read from (start_ts from the most recent TX cycle).
   /// Exposed so external buffer writers can align their write positions.
   read_position: Arc<AtomicUsize>,
+  /// Consistent (read_pos, monotonic_time) snapshot for precise timing calibration.
+  read_position_snapshot: Option<Arc<super::ReadPositionSnapshot>>,
+  /// Reference instant for monotonic_nanos in the snapshot.
+  snapshot_ref_instant: std::time::Instant,
   on_transfer: Option<TransferNotifier>,
   //callback: SamplesRequestCallback,
 }
@@ -156,6 +160,14 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         pbuff[5..9].copy_from_slice(&(subsec_samples as u32).to_be_bytes());
         let start_ts = (flow.next_ts as Clock).wrapping_add_signed(self.timestamp_shift);
         self.read_position.store(start_ts, Ordering::Release);
+        if let Some(snapshot) = &self.read_position_snapshot {
+            let seq = snapshot.seq.load(Ordering::Relaxed);
+            snapshot.seq.store(seq.wrapping_add(1), Ordering::Release); // odd = writing
+            snapshot.read_position.store(start_ts, Ordering::Relaxed);
+            let nanos = self.snapshot_ref_instant.elapsed().as_nanos() as u64;
+            snapshot.monotonic_nanos.store(nanos, Ordering::Relaxed);
+            snapshot.seq.store(seq.wrapping_add(2), Ordering::Release); // even = stable
+        }
         for (index_in_flow, &ch_opt) in flow.channel_indices.iter().enumerate() {
           if let Some(ch_index) = ch_opt {
             //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
@@ -479,6 +491,7 @@ impl FlowsTransmitter {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     read_position: Arc<AtomicUsize>,
+    read_position_snapshot: Option<Arc<super::ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) {
     let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
@@ -498,6 +511,8 @@ impl FlowsTransmitter {
         .unwrap(),
       current_timestamp,
       read_position,
+      read_position_snapshot,
+      snapshot_ref_instant: std::time::Instant::now(),
       on_transfer,
     };
     internal.run(start_time_rx).await;
@@ -511,6 +526,7 @@ impl FlowsTransmitter {
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
     read_position: Arc<AtomicUsize>,
+    read_position_snapshot: Option<Arc<super::ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
@@ -530,6 +546,7 @@ impl FlowsTransmitter {
         start_time_rx,
         current_timestamp,
         read_position,
+        read_position_snapshot,
         on_transfer,
       )
       .boxed_local()
