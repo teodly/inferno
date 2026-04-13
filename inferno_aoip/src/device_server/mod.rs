@@ -2,7 +2,7 @@ use crate::mdns_client::{MdnsClient, PointerToMulticast};
 use crate::media_clock::{
   async_clock_receiver_to_realtime, make_shared_media_clock, start_clock_receiver, ClockReceiver,
 };
-use crate::ring_buffer::{self, OwnedBuffer, ProxyToBuffer, ProxyToSamplesBuffer, RBOutput};
+use crate::ring_buffer::{self, ProxyToBuffer, ProxyToSamplesBuffer};
 use crate::state_storage::StateStorage;
 use atomic::Atomic;
 use flows_tx::FlowsTransmitter;
@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast as broadcast_queue, mpsc, watch, Mutex};
@@ -42,9 +42,74 @@ pub(crate) mod tx_multicasts;
 
 pub use crate::common::{Clock, ClockDiff, Sample};
 pub use crate::media_clock::{MediaClock, RealTimeClockReceiver};
-pub use crate::ring_buffer::{ExternalBufferParameters, PositionReportDestination};
+pub use crate::ring_buffer::{ExternalBufferParameters, OwnedBuffer, PositionReportDestination, RBInput, RBOutput};
+pub use crate::ring_buffer::new_owned as new_owned_ring_buffer;
 pub use settings::Settings;
 pub type AtomicSample = atomic::Atomic<Sample>;
+
+/// Consistent (read_position, monotonic_time) snapshot written by the TX thread
+/// at the exact point it updates `read_position`. Readers use a seqlock protocol:
+/// odd seq = writer active, even seq = stable. Retry if seq changes between reads.
+pub struct ReadPositionSnapshot {
+    seq: AtomicUsize,
+    read_position: AtomicUsize,
+    /// Nanoseconds elapsed since `ref_instant`.
+    monotonic_nanos: std::sync::atomic::AtomicU64,
+    /// Reference instant for monotonic_nanos. Set once by the TX thread at startup.
+    /// Readers reconstruct the snapshot instant as `ref_instant + Duration::from_nanos(monotonic_nanos)`.
+    ref_instant: OnceLock<std::time::Instant>,
+}
+
+impl ReadPositionSnapshot {
+    pub fn new() -> Self {
+        Self {
+            seq: AtomicUsize::new(0),
+            read_position: AtomicUsize::new(usize::MAX),
+            monotonic_nanos: std::sync::atomic::AtomicU64::new(0),
+            ref_instant: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn init_ref_instant(&self, instant: std::time::Instant) {
+        let _ = self.ref_instant.set(instant);
+    }
+
+    pub(crate) fn publish(&self, read_position: usize, monotonic_nanos: u64) {
+        let seq = self.seq.load(std::sync::atomic::Ordering::Relaxed);
+        self.seq
+            .store(seq.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        self.read_position
+            .store(read_position, std::sync::atomic::Ordering::Relaxed);
+        self.monotonic_nanos
+            .store(monotonic_nanos, std::sync::atomic::Ordering::Relaxed);
+        self.seq
+            .store(seq.wrapping_add(2), std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn try_read(&self) -> Option<(usize, std::time::Instant)> {
+        let ref_instant = *self.ref_instant.get()?;
+        for _ in 0..8 {
+            let seq1 = self.seq.load(std::sync::atomic::Ordering::Acquire);
+            if seq1 & 1 != 0 {
+                continue;
+            }
+            let pos = self
+                .read_position
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let nanos = self
+                .monotonic_nanos
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let seq2 = self.seq.load(std::sync::atomic::Ordering::Acquire);
+            if seq1 == seq2 {
+                if pos == usize::MAX {
+                    return None;
+                }
+                return Some((pos, ref_instant + Duration::from_nanos(nanos)));
+            }
+        }
+        None
+    }
+}
 
 use channels_subscriber::{ChannelsBuffering, ChannelsSubscriber, ExternalBuffering, OwnedBuffering};
 use peaks::peaks_of_buffers;
@@ -286,13 +351,54 @@ impl DeviceServer {
       tx_channels_buffers.iter().map(|par| ring_buffer::wrap_external_source(par, 0)).collect();
     let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
     *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
-    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, on_transfer).await;
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, None, None, on_transfer).await;
   }
+
+  /// Start transmitting from owned ring buffers.
+  ///
+  /// Creates `channel_count` owned ring buffers and returns the `RBInput` write handles.
+  /// The caller writes audio samples via `RBInput::write_from_at()`.
+  /// The `RBOutput` read handles are passed to the internal transmitter.
+  ///
+  /// Unlike `transmit_from_external_buffer`, owned buffers:
+  /// - Track `readable_pos` on the write side (inferno only reads validated data)
+  /// - Have `unconditional_read() == false` (reads check readable_pos)
+  /// - Support hole detection and fill via `hole_fix_wait`
+  ///
+  /// The `read_position` atomic is updated by the FlowsTransmitter with the actual
+  /// ring buffer position it reads from (`start_ts = next_ts + timestamp_shift`).
+  /// This allows external writers to align their write positions correctly.
+  pub async fn transmit_from_owned_buffer(
+    &mut self,
+    channel_count: usize,
+    buffer_length: usize,
+    hole_fix_wait: usize,
+    start_time_rx: tokio::sync::oneshot::Receiver<Clock>,
+    current_timestamp: Arc<AtomicUsize>,
+    read_position: Arc<AtomicUsize>,
+    read_position_snapshot: Option<Arc<ReadPositionSnapshot>>,
+    on_transfer: Option<TransferNotifier>,
+  ) -> Vec<ring_buffer::RBInput<Sample, OwnedBuffer<Atomic<Sample>>>> {
+    let mut rb_inputs = Vec::with_capacity(channel_count);
+    let mut rb_outputs = Vec::with_capacity(channel_count);
+    for _ in 0..channel_count {
+      let (input, output) = ring_buffer::new_owned(buffer_length, 0, hole_fix_wait);
+      rb_inputs.push(input);
+      rb_outputs.push(output);
+    }
+    let rbs = rb_outputs.iter().map(|rbo| rbo.shared().clone()).collect_vec();
+    *self.tx_peaks_supplier.write().unwrap() = Box::new(move || peaks_of_buffers(&rbs));
+    self.transmit(Some(start_time_rx), rb_outputs, current_timestamp, Some(read_position), read_position_snapshot, on_transfer).await;
+    rb_inputs
+  }
+
   async fn transmit<P: ProxyToSamplesBuffer + Send + Sync + 'static>(
     &mut self,
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     rb_outputs: Vec<RBOutput<Sample, P>>,
     current_timestamp: Arc<AtomicUsize>,
+    read_position: Option<Arc<AtomicUsize>>,
+    read_position_snapshot: Option<Arc<ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) {
     let clock_rx = self.clock_receiver.subscribe();
@@ -305,6 +411,8 @@ impl DeviceServer {
       rb_outputs.clone(),
       start_time_rx,
       current_timestamp.clone(),
+      read_position.unwrap_or_else(|| Arc::new(AtomicUsize::new(usize::MAX))),
+      read_position_snapshot,
       on_transfer,
     );
     *self.flows_tx.lock().await = Some(flows_tx_handle);

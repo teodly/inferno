@@ -103,6 +103,13 @@ struct FlowsTransmitterInternal<P: ProxyToSamplesBuffer> {
   timestamp_shift: ClockDiff,
   tx_source_bit_depth: u8,
   current_timestamp: Arc<AtomicUsize>,
+  /// The actual ring buffer position last read from (start_ts from the most recent TX cycle).
+  /// Exposed so external buffer writers can align their write positions.
+  read_position: Arc<AtomicUsize>,
+  /// Consistent (read_pos, monotonic_time) snapshot for precise timing calibration.
+  read_position_snapshot: Option<Arc<super::ReadPositionSnapshot>>,
+  /// Reference instant for monotonic_nanos in the snapshot.
+  snapshot_ref_instant: std::time::Instant,
   on_transfer: Option<TransferNotifier>,
   //callback: SamplesRequestCallback,
 }
@@ -152,6 +159,11 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         pbuff[1..5].copy_from_slice(&(seconds as u32).to_be_bytes());
         pbuff[5..9].copy_from_slice(&(subsec_samples as u32).to_be_bytes());
         let start_ts = (flow.next_ts as Clock).wrapping_add_signed(self.timestamp_shift);
+        self.read_position.store(start_ts, Ordering::Release);
+        if let Some(snapshot) = &self.read_position_snapshot {
+            let nanos = self.snapshot_ref_instant.elapsed().as_nanos() as u64;
+            snapshot.publish(start_ts, nanos);
+        }
         for (index_in_flow, &ch_opt) in flow.channel_indices.iter().enumerate() {
           if let Some(ch_index) = ch_opt {
             //(self.callback)(flow.next_ts, ch_index, &mut tmp_samples[0..flow.fpp]);
@@ -474,6 +486,8 @@ impl FlowsTransmitter {
     channels_outputs: Vec<RBOutput<Sample, P>>,
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
+    read_position: Arc<AtomicUsize>,
+    read_position_snapshot: Option<Arc<super::ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) {
     let latency: u32 = (latency_ns as u64 * sample_rate as u64 / 1_000_000_000u64).try_into().unwrap();
@@ -492,6 +506,15 @@ impl FlowsTransmitter {
         .try_into()
         .unwrap(),
       current_timestamp,
+      read_position,
+      read_position_snapshot: read_position_snapshot.clone(),
+      snapshot_ref_instant: {
+        let now = std::time::Instant::now();
+        if let Some(snap) = &read_position_snapshot {
+          snap.init_ref_instant(now);
+        }
+        now
+      },
       on_transfer,
     };
     internal.run(start_time_rx).await;
@@ -504,6 +527,8 @@ impl FlowsTransmitter {
     channels_outputs: Vec<RBOutput<Sample, P>>,
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     current_timestamp: Arc<AtomicUsize>,
+    read_position: Arc<AtomicUsize>,
+    read_position_snapshot: Option<Arc<super::ReadPositionSnapshot>>,
     on_transfer: Option<TransferNotifier>,
   ) -> (Self, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(100);
@@ -522,6 +547,8 @@ impl FlowsTransmitter {
         channels_outputs,
         start_time_rx,
         current_timestamp,
+        read_position,
+        read_position_snapshot,
         on_transfer,
       )
       .boxed_local()
