@@ -290,7 +290,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     self.rb.readable_pos.load(Ordering::Relaxed)
   }
 
-  fn close_items_until_internal(&self, close_until_pos: usize, check_until_pos: usize) {
+  fn close_items_until_internal(&mut self, close_until_pos: usize, check_until_pos: usize) {
     // Put default values in any holes in readable_pos..close_until_pos range:
     if wrapsub(close_until_pos, self.rb.readable_pos.load(Ordering::Relaxed)) > 0 {
       let mut hole = false;
@@ -303,6 +303,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
             if !self.item_ready.get(i).unwrap() {
               hole = true;
               buffer[i * self.rb.stride].store(T::default(), Ordering::Relaxed);
+              self.item_ready.set(i, true);
             }
           },
         );
@@ -337,7 +338,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
     }
   }
 
-  pub fn close_items_until(&self, mut until_pos: usize) {
+  pub fn close_items_until(&mut self, mut until_pos: usize) {
     let writing_pos = self.rb.writing_pos.load(Ordering::Relaxed);
     //debug!("writing_pos {writing_pos}, until_pos {until_pos}");
     let need_until_pos = until_pos;
@@ -354,6 +355,7 @@ impl<T: Default + NoUninit, P: ProxyToBuffer<Atomic<T>>> RBInput<T, P> {
       self.rb.buffer.map(|buffer| {
         for_in_ring(self.rb.items_size, until_pos, need_until_pos, |i| {
           buffer[i * self.rb.stride].store(T::default(), Ordering::Relaxed);
+          self.item_ready.set(i, true);
         })
       });
       self.rb.readable_pos.store(need_until_pos, Ordering::Release);
@@ -856,5 +858,314 @@ mod tests {
 
     writer.join().unwrap();
     reader.join().unwrap();
+  }
+
+  #[test]
+  fn test_close_items_until_noop_when_behind_readable_pos() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (0..4).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 4);
+    input.close_items_until(2);
+    assert_eq!(output.readable_until(), 4);
+    assert_eq!(output.holes_count(), 0);
+    let mut read_values = vec![0; 4];
+    assert_eq!(output.read_at(0, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 4 });
+    assert_eq!(read_values, vec![0, 1, 2, 3]);
+  }
+
+  #[test]
+  fn test_close_items_until_exact_boundary() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (0..4).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 4);
+    input.close_items_until(4);
+    assert_eq!(output.readable_until(), 4);
+    assert_eq!(output.holes_count(), 0);
+  }
+
+  #[test]
+  fn test_close_items_until_future_fill_empty_buffer() {
+    let (mut input, output) = new_owned(16, 100, 100);
+    let mut read_values = vec![-1; 8];
+    assert_eq!(output.read_at(100, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 0 });
+    input.close_items_until(108);
+    assert_eq!(output.readable_until(), 108);
+    assert_eq!(output.read_at(100, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 8 });
+    assert_eq!(read_values, vec![0; 8]);
+  }
+
+  #[test]
+  fn test_close_items_until_future_fill_past_writes() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (0..4).map(|x| x as i32));
+    let mut read_values = vec![-1; 8];
+    assert_eq!(output.read_at(4, &mut read_values[4..8]), ReadResult { useful_start_index: 0, useful_end_index: 0 });
+    input.close_items_until(8);
+    assert_eq!(output.readable_until(), 8);
+    assert_eq!(output.read_at(0, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 8 });
+    assert_eq!(read_values, vec![0, 1, 2, 3, 0, 0, 0, 0]);
+  }
+
+  #[test]
+  fn test_close_items_until_future_fill_wraparound() {
+    let (mut input, output) = new_owned(16, 14, 100);
+    let mut read_values = vec![-1; 4];
+    assert_eq!(output.read_at(14, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 0 });
+    input.close_items_until(18);
+    assert_eq!(output.readable_until(), 18);
+    assert_eq!(output.read_at(14, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 4 });
+    assert_eq!(read_values, vec![0; 4]);
+  }
+
+  #[test]
+  fn test_close_items_until_idempotent() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (0..2).map(|x| x as i32));
+    input.write_from_at(4, (4..6).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 2);
+    input.close_items_until(6);
+    assert_eq!(output.readable_until(), 6);
+    assert_eq!(output.holes_count(), 1);
+    input.close_items_until(6);
+    assert_eq!(output.readable_until(), 6);
+    assert_eq!(output.holes_count(), 1);
+    let mut read_values = vec![-1; 6];
+    assert_eq!(output.read_at(0, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 6 });
+    assert_eq!(read_values, vec![0, 1, 0, 0, 4, 5]);
+  }
+
+  #[test]
+  fn test_close_items_until_after_reset() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (100..108).map(|x| x as i32));
+    input.shared().reset(200);
+    let mut read_values = vec![-1; 4];
+    assert_eq!(output.read_at(200, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 0 });
+    input.close_items_until(204);
+    assert_eq!(output.readable_until(), 204);
+    assert_eq!(output.read_at(200, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 4 });
+    assert_eq!(read_values, vec![0; 4]);
+  }
+
+  #[test]
+  fn test_close_items_until_usize_wraparound() {
+    let (mut input, output) = new_owned(16, usize::MAX - 2, 100);
+    let mut read_values = vec![-1; 4];
+    assert_eq!(
+      output.read_at(usize::MAX - 2, &mut read_values),
+      ReadResult { useful_start_index: 0, useful_end_index: 0 }
+    );
+    input.close_items_until((usize::MAX - 2).wrapping_add(4));
+    assert_eq!(output.readable_until(), (usize::MAX - 2).wrapping_add(4));
+    assert_eq!(
+      output.read_at(usize::MAX - 2, &mut read_values),
+      ReadResult { useful_start_index: 0, useful_end_index: 4 }
+    );
+    assert_eq!(read_values, vec![0; 4]);
+  }
+
+  #[test]
+  fn test_close_items_until_mixed_ready_unready() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (0..2).map(|x| x as i32));
+    input.write_from_at(4, (4..6).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 2);
+    input.close_items_until(6);
+    assert_eq!(output.readable_until(), 6);
+    assert_eq!(output.holes_count(), 1);
+    let mut read_values = vec![-1; 6];
+    assert_eq!(output.read_at(0, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 6 });
+    assert_eq!(read_values, vec![0, 1, 0, 0, 4, 5]);
+  }
+
+  #[test]
+  fn test_close_items_until_consecutive_increasing() {
+    let (mut input, output) = new_owned(16, 0, 100);
+    input.write_from_at(0, (0..2).map(|x| x as i32));
+    input.write_from_at(6, (6..8).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 2);
+    input.close_items_until(4);
+    assert_eq!(output.readable_until(), 4);
+    assert_eq!(output.holes_count(), 1);
+    input.close_items_until(6);
+    assert_eq!(output.readable_until(), 6);
+    assert_eq!(output.holes_count(), 2);
+    input.close_items_until(8);
+    assert_eq!(output.readable_until(), 8);
+    assert_eq!(output.holes_count(), 2);
+    let mut read_values = vec![-1; 8];
+    assert_eq!(output.read_at(0, &mut read_values), ReadResult { useful_start_index: 0, useful_end_index: 8 });
+    assert_eq!(read_values, vec![0, 1, 0, 0, 0, 0, 6, 7]);
+  }
+
+  #[test]
+  fn test_close_items_until_does_not_zero_already_ready_items() {
+    let (mut input, output) = new_owned(16, 0, 100);
+
+    // Simulate an active audio stream: every slot is written and ready.
+    input.write_from_at(0, (100..108).map(|x| x as i32));
+    input.write_from_at(8, (108..116).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 16);
+
+    // On disconnect SilenceWriter starts calling close_items_until.
+    // It future-fills a bit, but existing ready samples stay as-is.
+    input.close_items_until(20);
+
+    assert_eq!(output.readable_until(), 20);
+    // Positions 16..19 were future-filled with zeros.
+    let mut read_future = vec![-1; 4];
+    assert_eq!(
+      output.read_at(16, &mut read_future),
+      ReadResult { useful_start_index: 0, useful_end_index: 4 }
+    );
+    assert_eq!(read_future, vec![0; 4]);
+
+    // The buffer slots behind readable_pos still hold the original audio.
+    // If the consumer reads near the current position (within items_size),
+    // it gets a mix of stale audio + silence — this is the corruption
+    // reported in issue #41.
+    let mut read_tail = vec![-1; 8];
+    assert_eq!(
+      output.read_at(12, &mut read_tail),
+      ReadResult { useful_start_index: 0, useful_end_index: 8 }
+    );
+    // positions 12..15 = original audio, 16..19 = zeros (future-filled)
+    assert_eq!(read_tail, vec![112, 113, 114, 115, 0, 0, 0, 0]);
+  }
+
+  /// Write via the ring_buffer API into an ExternalBuffer, then read the
+  /// underlying Vec directly (no ring_buffer read types involved).
+  /// Covers both the "If closing not-yet-touched items was requested" block
+  /// and wrap-around indexing of the future-fill path.
+  #[test]
+  fn test_external_buffer_close_items_until_future_fill_and_rotation() {
+    use atomic::Atomic;
+    use std::sync::atomic::Ordering;
+
+    let buf: Arc<Vec<Atomic<i32>>> = Arc::new((0..16).map(|_| Atomic::new(-1)).collect());
+    std::mem::forget(buf.clone());
+
+    let valid = Arc::new(std::sync::RwLock::new(true));
+    let params = unsafe {
+      ExternalBufferParameters::new(buf.as_ptr(), buf.len(), 1, valid.clone(), None)
+    };
+
+    let mut input = wrap_external_sink(&params, 12, 100);
+    let output = RBOutput { rb: input.shared().clone() };
+
+    // Write samples 14..18 (wraparound)
+    input.write_from_at(14, (100..104).map(|x| x as i32));
+    
+    // There must be a hole 12..14, but not counted yet since we haven't closed it
+    assert_eq!(output.holes_count(), 0);
+    assert_eq!(output.readable_until(), 12);
+    assert_eq!(buf[12].load(Ordering::Relaxed), -1);
+    assert_eq!(buf[13].load(Ordering::Relaxed), -1);
+    
+    
+    // Close the hole
+    // (actually, close items a bit before writing_pos to verify that it detects the hole already)
+    input.close_items_until(16);
+    
+    assert_eq!(output.holes_count(), 1);
+    assert_eq!(buf[12].load(Ordering::Relaxed), 0);
+    assert_eq!(buf[13].load(Ordering::Relaxed), 0);
+    
+    let last_holes_count = output.holes_count();
+    
+    input.close_items_until(18);
+    assert_eq!(output.readable_until(), 18);
+    assert_eq!(output.holes_count(), last_holes_count);
+
+    // read the underlying Vec directly, no ring_buffer types used
+    assert_eq!(buf[14].load(Ordering::Relaxed), 100);
+    assert_eq!(buf[15].load(Ordering::Relaxed), 101);
+    assert_eq!(buf[0].load(Ordering::Relaxed), 102);
+    assert_eq!(buf[1].load(Ordering::Relaxed), 103);
+    for i in 2..12 {
+      assert_eq!(buf[i].load(Ordering::Relaxed), -1);
+    }
+
+    // Future-fill past writing_pos; [16, 20) wraps to ring indices [0, 4).
+    input.close_items_until(20);
+
+    assert_eq!(output.readable_until(), 20);
+    assert_eq!(output.holes_count(), last_holes_count);
+
+    // Wrapped future-fill should have zeroed buf[0..4].
+    assert_eq!(buf[2].load(Ordering::Relaxed), 0);
+    assert_eq!(buf[3].load(Ordering::Relaxed), 0);
+
+    // Positions 14..18 must stay untouched.
+    assert_eq!(buf[14].load(Ordering::Relaxed), 100);
+    assert_eq!(buf[15].load(Ordering::Relaxed), 101);
+    assert_eq!(buf[0].load(Ordering::Relaxed), 102);
+    assert_eq!(buf[1].load(Ordering::Relaxed), 103);
+
+    // 12..14 contain the initial hole, already fixed
+    assert_eq!(buf[12].load(Ordering::Relaxed), 0);
+    assert_eq!(buf[13].load(Ordering::Relaxed), 0);
+    
+    // Everything else still carries the initial sentinel.
+    for i in 4..12 {
+      assert_eq!(buf[i].load(Ordering::Relaxed), -1);
+    }
+  }
+
+  /// Simulates what happens if flows_rx calls close_items_until(ts + latency)
+  /// *before* the actual network packet arrives.
+  #[test]
+  fn test_close_items_until_before_packet_arrives() {
+    // Use a 32-item buffer so that reading 18 samples from position 0
+    // does not trigger the "lagging behind > items_size" guard in read_at.
+    let (mut input, output) = new_owned(32, 0, 100);
+
+    // Phase 1: Timer fires ahead of the packet stream.
+    // Future-fills [0, 8) with zeros and advances writing_pos to 8.
+    input.close_items_until(8);
+    assert_eq!(output.readable_until(), 8);
+    assert_eq!(output.holes_count(), 0);
+
+    // Case A — whole packet BEFORE the closed position.
+    // A late/backlogged packet writes to [0, 4), entirely inside the
+    // future-filled range.  It overwrites its own slots but leaves the
+    // tail [4, 8) as zeros.
+    input.write_from_at(0, (42..46).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 8);
+
+    let mut buf = vec![-1; 8];
+    assert_eq!(output.read_at(0, &mut buf), ReadResult { useful_start_index: 0, useful_end_index: 8 });
+    assert_eq!(buf, vec![42, 43, 44, 45, 0, 0, 0, 0]);
+
+    // Case B — closed position INSIDE the packet time range.
+    // Packet [4, 10) straddles the boundary: [4, 8) overwrites zeros,
+    // [8, 10) is newly written.  writing_pos advances to 10.
+    input.write_from_at(4, (50..56).map(|x| x as i32));
+    assert_eq!(output.readable_until(), 10);
+
+    let mut buf2 = vec![-1; 10];
+    assert_eq!(output.read_at(0, &mut buf2), ReadResult { useful_start_index: 0, useful_end_index: 10 });
+    assert_eq!(buf2, vec![42, 43, 44, 45, 50, 51, 52, 53, 54, 55]);
+
+    // Case C — whole packet AFTER the closed position, creating a hole.
+    // Packet [14, 18) arrives with a gap [10, 14).
+    input.write_from_at(14, (70..74).map(|x| x as i32));
+    // readable_pos is stuck at 10 because of the hole.
+    assert_eq!(output.readable_until(), 10);
+
+    // A subsequent close_items_until fixes the hole [10, 14) with zeros
+    // and advances readable_pos to 18.
+    input.close_items_until(18);
+    assert_eq!(output.readable_until(), 18);
+    assert_eq!(output.holes_count(), 1);
+
+    let mut buf3 = vec![-1; 18];
+    assert_eq!(output.read_at(0, &mut buf3), ReadResult { useful_start_index: 0, useful_end_index: 18 });
+    let expected: Vec<i32> = vec![42, 43, 44, 45, 50, 51, 52, 53, 54, 55]
+      .into_iter()
+      .chain(vec![0; 4])
+      .chain(70..74)
+      .collect();
+    assert_eq!(buf3, expected);
   }
 }

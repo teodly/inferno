@@ -387,16 +387,16 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           // Normally this position will be already written because in self.receive we are writing into future
           // (write position is increased by latency_samples)
           // However, if the stream breaks, it will ensure that buffer is filled with zeros
-          for sd in self.sockets.iter().filter_map(|opt| opt.as_ref()) {
-            for ch in sd.channels.iter().filter_map(|opt| opt.as_ref()) {
-              for sink in &ch.sinks {
+          for sd in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
+            for ch in sd.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
+              for sink in &mut ch.sinks {
                 sink.close_items_until(ts);
               }
             }
           }
 
           let mut finished = None;
-          for (index, sw) in self.silence_writers.iter().enumerate() {
+          for (index, sw) in self.silence_writers.iter_mut().enumerate() {
             sw.sink.close_items_until(ts);
             if wrapped_diff(ts, sw.end_timestamp) >= 0 {
               finished = Some(index);
