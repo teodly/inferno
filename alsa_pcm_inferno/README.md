@@ -23,6 +23,27 @@ This plugin is entirely user-space and contained in a library. It means that the
 
 So the Inferno ALSA PCM is intended to be constantly running. The easiest way of ensuring this is using an audio server, for example [JACK](https://jackaudio.org/) (not tested yet) or [PipeWire](https://www.pipewire.org/) (see script [`start_pipewire_sink`](start_pipewire_sink)), making sure that automatic suspending of audio device is disabled (or, to save energy, set to a timeout long enough that it won't be annoying). Some DAWs (e.g. [Ardour](https://ardour.org/), [BespokeSynth](https://www.bespokesynth.com/), NOT Audacity) also keep the audio interface running all time.
 
+## Buffer sizes
+
+ALSA has the following buffering settings:
+
+* "buffer size" = whole (ring)buffer size - **does not influence latency**
+* "period size" - length of buffer part read/written at once by the application - it's the one that we usually call "buffer", or "latency", because latency does depend on it.
+* "periods" = whole_buffer_size / period_size - number of periods per whole buffer.
+
+Unlike ASIO, ALSA allows more than 2 periods per buffer (it is useful for energy saving), and this causes the confusion between "buffer size", "period size" and latency, as we can have large whole buffer **and** low latency, thanks to low period size.
+
+In PipeWire, there's additional setting, similar to ALSA period size: [`api.alsa.headroom`](https://docs.pipewire.org/page_man_pipewire-props_7.html) (in samples), which is *[t]he amount of extra space to keep in the ringbuffer*. Increasing it directly increases the latency.
+
+For receiving, the whole buffer size must be greater than `maximum receive latency + ALSA period size` (for PipeWire: `maximum receive latency + api.alsa.period-size + api.alsa.headroom`). Note that:
+
+* maximum receive latency does not necessarily equal `RX_LATENCY_NS` - some transmitting devices with high latency setting may force our receive latency to be higher.
+* latency in Dante UI (DC/DVS) is expressed in milliseconds or microseconds, in Inferno (and Dante protocol) - in nanoseconds, in ALSA and PipeWire config - in samples.
+
+When using Inferno in PipeWire, it is a good idea to set `api.alsa.headroom` to a value greater than 0. Actually, it is more important than `api.alsa.period-size`. In theory, as long as the CPU keeps up, `api.alsa.period-size` does not influence stability, but `api.alsa.headroom` does - it is the ***sample clock headroom*** parameter we need because Inferno is multi-threaded.
+
+Inferno will not work correctly with apps that allow nearly full buffers during capture, but fortunately this is rare. Fixing this would require jeopardizing the zero-copy architecture.
+
 
 # Quirks
 
