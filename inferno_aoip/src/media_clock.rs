@@ -43,7 +43,7 @@ impl MediaClock {
       let new_ovl_time = overlay.now_ns();
       let diff = (new_ovl_time as ClockDiff).wrapping_sub(cur_ovl_time as ClockDiff);
       /* if diff.abs() > 10_000_000 {
-        error!("clock is trying to jump dangerously by {diff} ns, ignoring update");
+        error!("clock is trying to jump dangerously by {diff} ns, ignoring update. This may indicate NTP collision or insufficient clock filtering.");
         return;
       } */
     } */
