@@ -41,7 +41,7 @@ Big thanks to [Project Pendulum](https://github.com/pendulum-project) (by [Trife
 | Disk space & RAM usage | 🌱 Low (~12MB RAM) | 🔥 High | 🌱 Low |
 | Written in | Rust | C++, Java | C++, C |
 | License | 🥰 FOSS, copyleft | 🔒 Closed source | 🥰 FOSS, copyleft |
-| [DRM](https://drm.info/what-is-drm.en.html) | 😊 No | 🔒 Actiation required, virtual machines banned | 😊 No |
+| [DRM](https://drm.info/what-is-drm.en.html) | 😊 No | 🔒 Activation required, virtual machines banned | 😊 No |
 | Price   | Free of charge | 🤑 50-80 USD ... *for a **device driver*** | Free of charge |
 | Privacy | 😊 No tracking | 😡 Registration required, telemetry enabled by default | 😊 No tracking |
 
