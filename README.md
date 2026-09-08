@@ -143,7 +143,10 @@ This project is dual licensed under the GPLv3-or-later and AGPLv3-or-later. You 
   * SQ-5
   * SQ-6
   * Qu-5D
-* Yamaha Dante-MY16-AUD (in Yamaha LS9) (also tested with old 3.x Dante firmware version)
+* Yamaha
+  * Dante-MY16-AUD (in Yamaha LS9) (also tested with old 3.x Dante firmware version)
+  * RIVAGE PM3
+  * DSP-RX
 * ESI planet 22c
 * Dante Via @ OS X and Windows 11
 * Dante Virtual Soundcard @ Windows 10
