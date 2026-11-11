@@ -289,6 +289,9 @@ If you want to contribute but can't code or don't know where to start because th
 
 # Changelog
 
+## Unreleased
+* advertise `TX_LATENCY_NS` (not `RX_LATENCY_NS`) as the latency of transmit channels and multicast flows in mDNS
+
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source
 * introduced automated integration test that launches several instances, streams audio data between them and checks for its correctness (including audio comparison). Currently tests JACK, PipeWire, aplay, arecord with alsa_pcm_inferno. SoX and Inferno2pipe are planned.

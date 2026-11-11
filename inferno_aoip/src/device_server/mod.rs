@@ -197,6 +197,7 @@ impl DeviceServer {
     let tx_multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>> = Default::default();
     let mdns_handle = Arc::new(mdns_server::DeviceMDNSResponder::start(
       self_info.clone(),
+      settings.tx_latency_ns,
       tx_multicasts_by_channel.clone(),
     ));
 

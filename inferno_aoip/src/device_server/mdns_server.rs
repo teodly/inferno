@@ -19,6 +19,7 @@ use crate::{
 pub struct DeviceMDNSResponder {
   handle: RwLock<Option<BroadcasterHandle>>,
   self_info: Arc<DeviceInfo>,
+  tx_latency_ns: u32,
   self_origin: Vec<u8>,
   multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>>,
 }
@@ -46,6 +47,7 @@ fn multicast_ip_to_name(addr: Ipv4Addr) -> Name {
 impl DeviceMDNSResponder {
   pub fn start(
     self_info: Arc<DeviceInfo>,
+    tx_latency_ns: u32,
     multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>>,
   ) -> Self {
     let hostname = Name::from_labels([self_info.friendly_hostname.as_bytes()]).unwrap();
@@ -90,6 +92,7 @@ impl DeviceMDNSResponder {
       handle: RwLock::new(Some(handle)),
       self_origin: self_origin_from_self_info(&self_info),
       self_info,
+      tx_latency_ns,
       multicasts_by_channel,
     }
   }
@@ -138,7 +141,7 @@ impl DeviceMDNSResponder {
         .add_txt_truncated(format!("pcm={} {:x}", self_info.bits_per_sample / 8, self_info.pcm_type))
         .add_txt_truncated(kv("enc", self_info.bits_per_sample))
         .add_txt_truncated(kv("en", self_info.bits_per_sample))
-        .add_txt_truncated(kv("latency_ns", self_info.latency_ns /* FIXME should be tx latency */))
+        .add_txt_truncated(kv("latency_ns", self.tx_latency_ns))
         .add_txt_truncated(format!("fpp={},{}", FPP_MAX_ADVERTISED, FPP_MIN))
         .add_txt_truncated(kv("nchan", MAX_CHANNELS_IN_FLOW.min(self_info.tx_channels.len() as u16)));
       if default {
@@ -226,7 +229,7 @@ impl DeviceMDNSResponder {
       .add_txt_truncated("txtvers=1")
       .add_txt_truncated(kv("id", bundle_id))
       .add_txt_truncated(kv("nchan", channels_per_flow))
-      .add_txt_truncated(kv("latency_ns", self_info.latency_ns /* FIXME should be tx latency */))
+      .add_txt_truncated(kv("latency_ns", self.tx_latency_ns))
       .add_txt_truncated(kv("fpp", fpp))
       .add_txt_truncated(kv("rate", self_info.sample_rate))
       .add_txt_truncated(kv("enc", self_info.bits_per_sample))
