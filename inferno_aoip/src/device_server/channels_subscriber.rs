@@ -591,7 +591,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     for (lci, advserv_opt) in join_all(dns_resolve_futures).await.into_iter() {
       if let Some(advserv) = advserv_opt {
         // The flow would play at the larger of both latencies; refuse what we may not play at.
-        if advserv.min_rx_latency_ns.max(self.min_latency_ns) > self.max_latency_ns {
+        if exceeds_max_latency(advserv.min_rx_latency_ns, self.min_latency_ns, self.max_latency_ns) {
           warn!(
             "{}@{} demands {} ns latency, over MAX_RX_LATENCY_NS ({} ns): not subscribing",
             advserv.tx_channel_id, advserv.addr, advserv.min_rx_latency_ns, self.max_latency_ns
@@ -1373,6 +1373,38 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       //*self.self_info.rx_channels[lci].friendly_name.write().unwrap() = chst.local_channel_name;
       self.subscribe(lci, &chst.tx_channel_name, &chst.tx_hostname).await;
     }
+  }
+}
+
+/// The flow plays at the larger of the transmitter's and our own latency.
+fn exceeds_max_latency(advertised_ns: usize, own_ns: usize, max_ns: usize) -> bool {
+  advertised_ns.max(own_ns) > max_ns
+}
+
+#[cfg(test)]
+mod latency_limit_tests {
+  use super::*;
+
+  #[test]
+  fn within_limit_is_accepted_and_the_limit_itself_too() {
+    assert!(!exceeds_max_latency(1_000_000, 10_000_000, 10_000_000));
+    assert!(!exceeds_max_latency(10_000_000, 1_000_000, 10_000_000));
+  }
+
+  #[test]
+  fn transmitter_demanding_more_than_the_limit_is_refused() {
+    assert!(exceeds_max_latency(10_000_001, 1_000_000, 10_000_000));
+  }
+
+  #[test]
+  fn our_own_latency_over_the_limit_is_refused_too() {
+    assert!(exceeds_max_latency(1_000_000, 20_000_000, 10_000_000));
+  }
+
+  #[test]
+  fn channel_latency_status_is_dante_26_and_not_receiving() {
+    assert_eq!(SubscriptionStatus::ChannelLatency as u32, 26);
+    assert!(!SubscriptionStatus::ChannelLatency.is_receiving());
   }
 }
 

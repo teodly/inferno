@@ -369,6 +369,37 @@ mod robustness_tests {
     assert_eq!(parse_product_version(""), None);
   }
 
+  fn latency_settings(pairs: &[(&str, &str)]) -> Settings {
+    let config = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    Settings::new("test", "t", Some(Ipv4Addr::LOCALHOST), &config)
+  }
+
+  #[test]
+  fn latency_defaults() {
+    let s = latency_settings(&[]);
+    assert_eq!(s.self_info.latency_ns, 10_000_000);
+    assert_eq!(s.tx_latency_ns, 10_000_000);
+    assert_eq!(s.max_rx_latency_ns as usize, crate::mdns_client::MAX_ADVERTISED_LATENCY_NS);
+  }
+
+  #[test]
+  fn latency_settings_are_independent() {
+    let s = latency_settings(&[
+      ("RX_LATENCY_NS", "5000000"),
+      ("TX_LATENCY_NS", "1000000"),
+      ("MAX_RX_LATENCY_NS", "20000000"),
+    ]);
+    assert_eq!(s.self_info.latency_ns, 5_000_000);
+    assert_eq!(s.tx_latency_ns, 1_000_000);
+    assert_eq!(s.max_rx_latency_ns, 20_000_000);
+  }
+
+  #[test]
+  #[should_panic(expected = "MAX_RX_LATENCY_NS")]
+  fn invalid_max_rx_latency_is_refused() {
+    latency_settings(&[("MAX_RX_LATENCY_NS", "fast")]);
+  }
+
   #[test]
   fn parse_product_version_accepts_two_parts() {
     assert_eq!(parse_product_version("1.2"), Some((1, 2, 0)));
