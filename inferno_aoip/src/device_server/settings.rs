@@ -216,6 +216,9 @@ mod product_version_tests {
 pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
+  /// MAX_RX_LATENCY_NS: a subscription whose latency (the larger of ours and
+  /// the transmitter's advertised) exceeds this is refused with the "channel latency" status.
+  pub max_rx_latency_ns: u32,
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
@@ -266,6 +269,10 @@ impl Settings {
         .get("TX_LATENCY_NS")
         .map(|p| p.parse().expect("invalid TX_LATENCY_NS, must be integer"))
         .unwrap_or(10_000_000),
+      max_rx_latency_ns: config
+        .get("MAX_RX_LATENCY_NS")
+        .map(|p| p.parse().expect("invalid MAX_RX_LATENCY_NS, must be integer"))
+        .unwrap_or(crate::mdns_client::MAX_ADVERTISED_LATENCY_NS as u32),
       clock_path: config.get("CLOCK_PATH").map(|p| p.try_into().unwrap()),
       use_safe_clock,
       tx_source_bit_depth,

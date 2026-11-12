@@ -170,6 +170,7 @@ pub struct DeviceServer {
   mdns_server: Arc<DeviceMDNSResponder>,
   mcast_tx: mpsc::Sender<crate::protocol::mcast::MulticastMessage>,
   tx_latency_ns: u32,
+  max_rx_latency_ns: u32,
   tx_source_bit_depth: u8,
   channels_sub_tx: watch::Sender<Option<Arc<ChannelsSubscriber>>>,
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
@@ -287,6 +288,7 @@ impl DeviceServer {
       mdns_server,
       mcast_tx,
       tx_latency_ns: settings.tx_latency_ns,
+      max_rx_latency_ns: settings.max_rx_latency_ns,
       tx_source_bit_depth: settings.tx_source_bit_depth,
       channels_sub_tx,
       channels_subscriber: None,
@@ -377,6 +379,7 @@ impl DeviceServer {
       // The receiver's own minimum latency is RX_LATENCY_NS (it used the
       // transmit latency, so RX_LATENCY_NS was announced but never used).
       self.self_info.latency_ns.try_into().unwrap_or(u32::MAX),
+      self.max_rx_latency_ns,
       self.state_storage.clone(),
       srx2,
       self.ref_instant,

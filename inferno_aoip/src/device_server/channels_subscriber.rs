@@ -63,6 +63,9 @@ pub enum SubscriptionStatus {
   InProgress = 8,
   TooManyTxFlows = 0x14, // TODO propagate error from tx's reply
   TxFail = 0x15,
+  /// The transmitter demands more latency than MAX_RX_LATENCY_NS allows. 26 = the
+  /// Dante API's "channel latency" status, from memory, unverified against real hardware.
+  ChannelLatency = 0x1A,
   ReceivingUnicast = 0x01010009,
   ReceivingMulticast = 0x0101000a,
 }
@@ -113,6 +116,7 @@ impl ChannelsSubscriber {
     mcast: mpsc::Sender<MulticastMessage>,
     channels_buffering: B,
     tx_latency_ns: u32,
+    max_latency_ns: u32,
     state_storage: Arc<StateStorage>,
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     ref_instant: Instant,
@@ -133,6 +137,7 @@ impl ChannelsSubscriber {
       mcast,
       channels_buffering,
       tx_latency_ns,
+      max_latency_ns,
       state_storage,
       ref_instant,
     );
@@ -374,6 +379,7 @@ struct ChannelsSubscriberInternal<P: ProxyToSamplesBuffer, B: ChannelsBuffering<
   flows_recv: Arc<FlowsReceiver<P>>,
   //buffered_samples_per_channel: usize,
   min_latency_ns: usize,
+  max_latency_ns: usize,
   ring_buffer_timestamp_shift: isize,
   control_client: Arc<FlowsControlClient>,
   mdns_client: Arc<MdnsClient>,
@@ -399,6 +405,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     mcast: mpsc::Sender<MulticastMessage>,
     channels_buffering: B,
     tx_latency_ns: u32,
+    max_latency_ns: u32,
     state_storage: Arc<StateStorage>,
     ref_instant: Instant,
   ) -> Self {
@@ -412,6 +419,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       flows_recv,
       //buffered_samples_per_channel: 524288,
       min_latency_ns: tx_latency_ns.try_into().unwrap(),
+      max_latency_ns: max_latency_ns.try_into().unwrap(),
       ring_buffer_timestamp_shift: 0,
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
@@ -579,8 +587,18 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     // Add all needed servers to map:
     let mut channels_per_server = BTreeMap::<SocketAddr, BTreeMap<usize, AdvertisedChannel>>::new();
     let mut channels_per_bundle = BTreeMap::<String, BTreeMap<usize, AdvertisedChannel>>::new();
+    let mut too_slow = vec![];
     for (lci, advserv_opt) in join_all(dns_resolve_futures).await.into_iter() {
       if let Some(advserv) = advserv_opt {
+        // The flow would play at the larger of both latencies; refuse what we may not play at.
+        if advserv.min_rx_latency_ns.max(self.min_latency_ns) > self.max_latency_ns {
+          warn!(
+            "{}@{} demands {} ns latency, over MAX_RX_LATENCY_NS ({} ns): not subscribing",
+            advserv.tx_channel_id, advserv.addr, advserv.min_rx_latency_ns, self.max_latency_ns
+          );
+          too_slow.extend(channel_index_aliases[&lci].iter().copied());
+          continue;
+        }
         match &advserv.multicast {
           None => {
             channels_per_server.entry(advserv.addr).or_default().insert(lci, advserv);
@@ -593,6 +611,24 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           }
         }
       }
+    }
+
+    // Notify controllers only about channels whose status changed (this runs on every retry).
+    let newly_refused: Vec<usize> = {
+      let mut subinfos = self.subscriptions_info.write().unwrap();
+      too_slow
+        .into_iter()
+        .filter(|&chi| match subinfos[chi].as_mut() {
+          Some(subi) if subi.status != SubscriptionStatus::ChannelLatency => {
+            subi.status = SubscriptionStatus::ChannelLatency;
+            true
+          }
+          _ => false,
+        })
+        .collect()
+    };
+    if !newly_refused.is_empty() {
+      self.notify_channels_change(newly_refused).await;
     }
 
     // Check for surprises:
