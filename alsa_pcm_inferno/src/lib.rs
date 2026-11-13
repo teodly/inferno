@@ -469,6 +469,17 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     }
     *this.buffers_valid.write().unwrap() = true;
 
+    // A playback stream that has just been prepared can take a whole
+    // buffer, so tell apps that poll before they write, as cpal does, or
+    // they would wait for a transfer that only their writes can start
+    if (*io).stream == SND_PCM_STREAM_PLAYBACK && this.on_transfer_enabled {
+        libc::write(
+            this.on_transfer_eventfd,
+            [1u64].as_ptr() as *const c_void,
+            8,
+        );
+    }
+
     0
 }
 
@@ -583,8 +594,14 @@ unsafe extern "C" fn plugin_demangle_revents(
                 SND_PCM_STREAM_CAPTURE => POLLIN,
                 _ => return -libc::EINVAL,
             };
-            let mut blackhole: [u64; 1] = [0];
-            libc::read((*pfd).fd, blackhole.as_mut_ptr() as *mut c_void, 8);
+            // A playback stream that has not started stays writable until
+            // the app has written enough to start it, so its event stays
+            let waiting =
+                (*io).stream == SND_PCM_STREAM_PLAYBACK && get_private(io).start_time.is_none();
+            if !waiting {
+                let mut blackhole: [u64; 1] = [0];
+                libc::read((*pfd).fd, blackhole.as_mut_ptr() as *mut c_void, 8);
+            }
         }
         *revents = out_events as _;
     } else {
