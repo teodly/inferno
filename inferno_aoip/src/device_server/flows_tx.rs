@@ -3,7 +3,12 @@ use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
-use std::{collections::BTreeMap, net::SocketAddr, sync::atomic::AtomicU32, time::Duration};
+use std::{
+  collections::BTreeMap,
+  net::SocketAddr,
+  sync::atomic::AtomicU32,
+  time::{Duration, Instant},
+};
 
 use atomic::Ordering;
 use futures::FutureExt;
@@ -15,7 +20,7 @@ use tokio::{select, sync::mpsc};
 
 use super::samples_utils::*;
 use super::tx_multicasts::MEDIA_PORT;
-use crate::device_server::TransferNotifier;
+use crate::device_server::{NotifyThrottle, TransferNotifier};
 use crate::media_clock::async_clock_receiver_to_realtime;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBOutput};
 use crate::util::os::set_current_thread_realtime;
@@ -269,10 +274,12 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
       }
     };
     let mut next_on_transfer = now as Clock;
+    let mut notify =
+      self.on_transfer.as_ref().map(|t| NotifyThrottle::new(t.max_interval_samples, sample_rate as u32));
     let mut next_process_events = now as Clock;
-    drop(now);
+    let _ = now;
 
-    set_current_thread_realtime(81);
+    let _ = set_current_thread_realtime(81);
     loop {
       let min_next_ts = self
         .flows
@@ -314,7 +321,13 @@ impl<P: ProxyToSamplesBuffer> FlowsTransmitterInternal<P> {
         self
           .current_timestamp
           .store(cur_ts_opt.unwrap_or(usize::MAX), Ordering::SeqCst /*TODO: really needed?*/);
-        self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
+        // Rate limited: this branch runs once per packet. (The branch below
+        // precedes a long wait, so it always notifies.)
+        if let Some(transfer) = self.on_transfer.as_ref() {
+          if notify.as_mut().is_some_and(|n| n.due(Instant::now())) {
+            (transfer.callback)();
+          }
+        }
 
         if !sleep_duration.is_zero() {
           std::thread::sleep(sleep_duration);
@@ -433,9 +446,60 @@ struct FlowData {
   cookie: u16,
   remote: SocketAddr,
   expired: Arc<AtomicBool>,
+  // the TX thread's packet layout, needed to validate later channel changes
+  fpp: usize,
+  bytes_per_sample: usize,
 }
 
-#[derive(Debug)]
+/// Media packet header (type byte, seconds, subsecond samples) before the samples.
+const MEDIA_HEADER_BYTES: usize = 9;
+
+/// Why a flow (requested over the network, or created for multicast) cannot be sent.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FlowLayoutError {
+  #[error("unsupported bytes per sample: {0}")]
+  BytesPerSample(usize),
+  #[error("frames per packet {0} outside {FPP_MIN}..={FPP_MAX}")]
+  FramesPerPacket(usize),
+  #[error("channel index {index} but only {channels} TX channels")]
+  ChannelIndex { index: usize, channels: usize },
+  #[error("packet of {0} bytes does not fit the {MTU}-byte buffer")]
+  PacketTooLarge(usize),
+}
+
+/// Checks a flow before it reaches the TX thread, which slices its MTU-sized
+/// packet buffer with `channels * bytes_per_sample * fpp`, indexes its channel
+/// sources with the channel indices and advances each flow by `fpp` frames per
+/// packet (0 would never advance): all of these come from network requests.
+/// The channel count itself is bounded only by the packet size.
+pub fn validate_flow_layout(
+  channel_indices: &[Option<usize>],
+  fpp: usize,
+  bytes_per_sample: usize,
+  num_channels: usize,
+) -> Result<(), FlowLayoutError> {
+  if !(2..=4).contains(&bytes_per_sample) {
+    return Err(FlowLayoutError::BytesPerSample(bytes_per_sample));
+  }
+  if !(FPP_MIN as usize..=FPP_MAX as usize).contains(&fpp) {
+    return Err(FlowLayoutError::FramesPerPacket(fpp));
+  }
+  if let Some(&index) = channel_indices.iter().flatten().find(|&&i| i >= num_channels) {
+    return Err(FlowLayoutError::ChannelIndex { index, channels: num_channels });
+  }
+  let packet_bytes = MEDIA_HEADER_BYTES + channel_indices.len() * bytes_per_sample * fpp;
+  if packet_bytes > MTU {
+    return Err(FlowLayoutError::PacketTooLarge(packet_bytes));
+  }
+  Ok(())
+}
+
+fn invalid_input(e: FlowLayoutError) -> std::io::Error {
+  error!("rejecting flow: {e}");
+  std::io::Error::new(std::io::ErrorKind::InvalidInput, e)
+}
+
+#[derive(Debug, Clone)]
 pub struct FlowInfo {
   pub rx_hostname: Option<String>,
   pub rx_flow_name: Option<String>,
@@ -450,6 +514,20 @@ impl FlowInfo {
   }
 }
 
+/// A unicast flow as it stood when its transmitter stopped. The next
+/// transmitter re-creates it with the same index and cookie (see
+/// FlowsTransmitter::restore), so the handle a receiver holds stays valid
+/// across a transmitter restart.
+#[derive(Debug, Clone)]
+pub struct SavedFlow {
+  index: u32,
+  cookie: u16,
+  remote: SocketAddr,
+  fpp: usize,
+  bytes_per_sample: usize,
+  info: FlowInfo,
+}
+
 pub struct FlowsTransmitter {
   self_info: Arc<DeviceInfo>,
   flow_seq_id: AtomicU32,
@@ -457,6 +535,8 @@ pub struct FlowsTransmitter {
   ip_port_to_id: BTreeMap<SocketAddr, u32>,
   commands_sender: mpsc::Sender<Command>,
   flows_info: Vec<Option<FlowInfo>>,
+  // number of channel sources the TX thread reads from
+  num_channels: usize,
 }
 
 fn split_handle(h: FlowHandle) -> (u32, u16) {
@@ -509,6 +589,7 @@ impl FlowsTransmitter {
     let (tx, rx) = mpsc::channel(100);
     let tx1 = tx.clone();
     let srate = self_info.sample_rate;
+    let num_channels = channels_outputs.len();
     // TODO dehardcode latency_ns
     let thread_join = run_future_in_new_thread("flows TX", move || {
       Self::run(
@@ -534,6 +615,7 @@ impl FlowsTransmitter {
         flows: BTreeMap::new(),
         ip_port_to_id: BTreeMap::new(),
         flows_info: (0..MAX_FLOWS).map(|_| None).collect_vec(),
+        num_channels,
       },
       thread_join,
     );
@@ -555,9 +637,17 @@ impl FlowsTransmitter {
     is_multicast: bool,
   ) -> Result<(usize, FlowHandle), std::io::Error> {
     let channel_indices = flow_info.local_channel_indices.clone();
+    if let Some(index) = requested_flow_index {
+      if index >= MAX_FLOWS {
+        error!("requested flow index out of range: {index}");
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+      }
+    }
     let dst_addr = SocketAddr::new(IpAddr::V4(flow_info.dst_addr), flow_info.dst_port);
     let (flow_index, cookie) = match self.ip_port_to_id.get(&dst_addr) {
       None => {
+        validate_flow_layout(&channel_indices, fpp, bytes_per_sample, self.num_channels)
+          .map_err(invalid_input)?;
         self.scan_expired().await;
         let mut counter = 0;
         let flow_index = loop {
@@ -586,6 +676,8 @@ impl FlowsTransmitter {
           remote: dst_addr.clone(),
           // we're adding multicast flow as 'expired' to give it grace period for multicast address collission detection
           expired: Arc::new(AtomicBool::new(is_multicast)),
+          fpp,
+          bytes_per_sample,
         };
 
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))?;
@@ -614,6 +706,16 @@ impl FlowsTransmitter {
       Some(&flow_index) => {
         warn!("got add flow request for already existing flow, setting channels instead");
         // TODO FIXME what if fpp or bytes_per_sample change?
+        // the TX thread keeps the existing flow's layout, so validate against that
+        let existing = self.flows.get(&flow_index).ok_or(std::io::ErrorKind::NotFound)?;
+        validate_flow_layout(
+          &channel_indices,
+          existing.fpp,
+          existing.bytes_per_sample,
+          self.num_channels,
+        )
+        .map_err(invalid_input)?;
+        let cookie = existing.cookie;
         self
           .commands_sender
           .send(Command::SetChannels {
@@ -621,8 +723,8 @@ impl FlowsTransmitter {
             channel_indices: channel_indices.clone(),
           })
           .await
-          .unwrap();
-        (flow_index, self.flows.get(&flow_index).unwrap().cookie)
+          .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        (flow_index, cookie)
       }
     };
 
@@ -636,9 +738,16 @@ impl FlowsTransmitter {
 
     Ok((flow_index as usize, flow_handle))
   }
-  pub fn activate_multicast_flow(&mut self, flow_index: u32) {
-    // this is called for multicast flows after grace period
-    self.flows.get(&flow_index).as_ref().unwrap().expired.store(false, Ordering::Release);
+  /// Called for multicast flows after the grace period. Returns false when the
+  /// flow no longer exists (it was deleted during the grace period).
+  pub fn activate_multicast_flow(&mut self, flow_index: u32) -> bool {
+    match self.flows.get(&flow_index) {
+      Some(flow) => {
+        flow.expired.store(false, Ordering::Release);
+        true
+      }
+      None => false,
+    }
   }
   pub fn random_multicast_destination(&self) -> (Ipv4Addr, u16) {
     loop {
@@ -687,13 +796,15 @@ impl FlowsTransmitter {
     handle: FlowHandle,
     channel_indices: impl IntoIterator<Item = Option<usize>>,
   ) -> Result<usize, std::io::Error> {
-    if let Some((index, _)) = self.get_flow(handle) {
+    if let Some((index, flow)) = self.get_flow(handle) {
       let channel_indices = channel_indices.into_iter().collect_vec();
+      validate_flow_layout(&channel_indices, flow.fpp, flow.bytes_per_sample, self.num_channels)
+        .map_err(invalid_input)?;
       self
         .commands_sender
         .send(Command::SetChannels { index: index as usize, channel_indices: channel_indices.clone() })
         .await
-        .unwrap();
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
 
       self.flows_info[index as usize].as_mut().unwrap().local_channel_indices = channel_indices;
       Ok(index as usize)
@@ -720,10 +831,260 @@ impl FlowsTransmitter {
       self.remove_flow_internal(id).await;
     }
   }
+  /// The live unicast flows, for the next transmitter to restore. Multicast
+  /// flows are restored by TransmitMulticasts from its own state, and
+  /// expired flows have no receiver left to keep.
+  pub fn snapshot(&self) -> Vec<SavedFlow> {
+    self
+      .flows
+      .iter()
+      .filter_map(|(&index, flow)| {
+        let info = self.flows_info.get(index as usize)?.as_ref()?;
+        if info.is_multicast() || flow.expired.load(Ordering::Acquire) {
+          return None;
+        }
+        Some(SavedFlow {
+          index,
+          cookie: flow.cookie,
+          remote: flow.remote,
+          fpp: flow.fpp,
+          bytes_per_sample: flow.bytes_per_sample,
+          info: info.clone(),
+        })
+      })
+      .collect()
+  }
+
+  /// Re-creates saved flows with their original index and cookie, so their
+  /// receivers keep streaming (and their keepalives keep matching) across a
+  /// transmitter restart. A flow whose layout no longer fits this
+  /// transmitter, or whose slot or destination is already taken, is
+  /// skipped. Returns how many were restored.
+  pub async fn restore(&mut self, saved: Vec<SavedFlow>) -> usize {
+    let mut restored = 0;
+    for flow in saved {
+      if flow.index >= MAX_FLOWS
+        || self.flows.contains_key(&flow.index)
+        || self.ip_port_to_id.contains_key(&flow.remote)
+      {
+        warn!("not restoring flow {} to {}: slot or destination in use", flow.index, flow.remote);
+        continue;
+      }
+      if let Err(e) =
+        validate_flow_layout(&flow.info.local_channel_indices, flow.fpp, flow.bytes_per_sample, self.num_channels)
+      {
+        warn!("not restoring flow {} to {}: {e}", flow.index, flow.remote);
+        continue;
+      }
+      let socket = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(self.self_info.ip_address), 0))
+        .and_then(|sock| sock.connect(flow.remote).map(|_| sock))
+        .and_then(|sock| sock.set_nonblocking(true).map(|_| sock))
+      {
+        Ok(sock) => sock,
+        Err(e) => {
+          warn!("not restoring flow {} to {}: {e}", flow.index, flow.remote);
+          continue;
+        }
+      };
+      let expired = Arc::new(AtomicBool::new(false));
+      if self
+        .commands_sender
+        .send(Command::AddFlow {
+          index: flow.index as usize,
+          socket,
+          channel_indices: flow.info.local_channel_indices.clone(),
+          fpp: flow.fpp,
+          bytes_per_sample: flow.bytes_per_sample,
+          needs_keepalives: true,
+          expired: expired.clone(),
+        })
+        .await
+        .is_err()
+      {
+        break;
+      }
+      self.flows.insert(
+        flow.index,
+        FlowData {
+          cookie: flow.cookie,
+          remote: flow.remote,
+          expired,
+          fpp: flow.fpp,
+          bytes_per_sample: flow.bytes_per_sample,
+        },
+      );
+      self.ip_port_to_id.insert(flow.remote, flow.index);
+      self.flows_info[flow.index as usize] = Some(flow.info);
+      restored += 1;
+    }
+    restored
+  }
+
   pub fn is_empty(&self) -> bool {
     self.flows.is_empty()
   }
   pub fn get_flows_info(&self) -> &Vec<Option<FlowInfo>> {
     &self.flows_info
+  }
+}
+
+#[cfg(test)]
+mod layout_tests {
+  use super::*;
+
+  #[test]
+  fn accepts_typical_flows() {
+    assert_eq!(validate_flow_layout(&[Some(0), Some(1)], 16, 3, 2), Ok(()));
+    assert_eq!(validate_flow_layout(&[Some(7), None, Some(0)], 32, 4, 8), Ok(()));
+    // multicast: 15 channels of 24-bit at 32 fpp still fit one packet
+    assert_eq!(validate_flow_layout(&vec![Some(0); 15], 32, 3, 1), Ok(()));
+  }
+
+  #[test]
+  fn rejects_what_would_panic_or_stall_the_tx_thread() {
+    use FlowLayoutError::*;
+    assert_eq!(validate_flow_layout(&[Some(0)], 16, 0, 1), Err(BytesPerSample(0)));
+    assert_eq!(validate_flow_layout(&[Some(0)], 16, 536870911, 1), Err(BytesPerSample(536870911)));
+    assert_eq!(validate_flow_layout(&[Some(0)], 0, 3, 1), Err(FramesPerPacket(0)));
+    assert_eq!(validate_flow_layout(&[Some(0)], FPP_MAX as usize + 1, 3, 1), Err(FramesPerPacket(257)));
+    assert_eq!(validate_flow_layout(&[Some(2)], 16, 3, 2), Err(ChannelIndex { index: 2, channels: 2 }));
+    assert_eq!(
+      validate_flow_layout(&[None, Some(usize::MAX)], 16, 3, 2),
+      Err(ChannelIndex { index: usize::MAX, channels: 2 })
+    );
+    // 8 channels of 24-bit at FPP_MAX: within the old fpp check, but 6153 bytes
+    assert_eq!(validate_flow_layout(&vec![Some(0); 8], 256, 3, 1), Err(PacketTooLarge(6153)));
+    assert_eq!(validate_flow_layout(&vec![None; 700], 2, 4, 1), Err(PacketTooLarge(5609)));
+  }
+
+  #[test]
+  fn empty_channel_list_is_ok() {
+    assert_eq!(validate_flow_layout(&[], 2, 3, 1), Ok(()));
+  }
+
+  #[test]
+  fn bytes_per_sample_out_of_range() {
+    assert!(validate_flow_layout(&[Some(0)], 16, 1, 1).is_err());
+    assert!(validate_flow_layout(&[Some(0)], 16, 5, 1).is_err());
+  }
+
+  #[test]
+  fn channel_index_equal_to_count_rejected() {
+    assert_eq!(
+      validate_flow_layout(&[Some(2)], 16, 3, 2),
+      Err(FlowLayoutError::ChannelIndex { index: 2, channels: 2 })
+    );
+  }
+
+  #[test]
+  fn packet_size_limit_is_exact() {
+    // 9 + n * 4 * 2 <= MTU  =>  n = 186 fits, 187 does not
+    assert_eq!(validate_flow_layout(&vec![None; 186], 2, 4, 1), Ok(()));
+    assert!(validate_flow_layout(&vec![None; 187], 2, 4, 1).is_err());
+  }
+}
+
+#[cfg(test)]
+mod restart_tests {
+  use super::*;
+  use netdev::mac::MacAddr;
+
+  fn device_info() -> DeviceInfo {
+    DeviceInfo {
+      ip_address: Ipv4Addr::LOCALHOST,
+      netmask: Ipv4Addr::UNSPECIFIED,
+      gateway: Ipv4Addr::UNSPECIFIED,
+      mac_address: MacAddr::zero(),
+      link_speed: 0,
+      board_name: String::new(),
+      manufacturer: String::new(),
+      model_name: String::new(),
+      model_number: String::new(),
+      factory_device_id: [0; 8],
+      process_id: 0,
+      vendor_string: String::new(),
+      friendly_hostname: String::new(),
+      factory_hostname: String::new(),
+      rx_channels: Vec::new(),
+      tx_channels: Vec::new(),
+      bits_per_sample: 24,
+      pcm_type: 0,
+      latency_ns: 10_000_000,
+      sample_rate: 48000,
+      arc_port: 0,
+      cmc_port: 0,
+      flows_control_port: 0,
+      info_request_port: 0,
+      product_version: None,
+      name_request_path: None,
+      latency_request_path: None,
+      sample_rate_request_path: None,
+      announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+      announced_latency_ns: Default::default(),
+      state_dir: None,
+    }
+  }
+
+  // A FlowsTransmitter without its TX thread: the receiver end of its
+  // command channel stands in, so the commands it would send can be checked.
+  fn transmitter(num_channels: usize) -> (FlowsTransmitter, mpsc::Receiver<Command>) {
+    let (tx, rx) = mpsc::channel(32);
+    (
+      FlowsTransmitter {
+        self_info: Arc::new(device_info()),
+        flow_seq_id: 0.into(),
+        flows: BTreeMap::new(),
+        ip_port_to_id: BTreeMap::new(),
+        commands_sender: tx,
+        flows_info: (0..MAX_FLOWS).map(|_| None).collect(),
+        num_channels,
+      },
+      rx,
+    )
+  }
+
+  fn unicast(port: u16, channels: Vec<Option<usize>>) -> FlowInfo {
+    FlowInfo {
+      rx_hostname: Some("pi-b".into()),
+      rx_flow_name: Some("f".into()),
+      dst_addr: Ipv4Addr::LOCALHOST,
+      dst_port: port,
+      local_channel_indices: channels,
+    }
+  }
+
+  #[tokio::test]
+  async fn restart_keeps_unicast_flows_with_their_handles() {
+    let (mut old, _old_rx) = transmitter(2);
+    let (_, handle) = old.add_flow(unicast(41001, vec![Some(0), Some(1)]), 32, 3, None, false).await.unwrap();
+    let (gone_idx, _) = old.add_flow(unicast(41002, vec![Some(0)]), 32, 3, None, false).await.unwrap();
+    old.flows.get(&(gone_idx as u32)).unwrap().expired.store(true, Ordering::Release); // receiver gone
+    let multicast = FlowInfo { rx_hostname: None, rx_flow_name: None, ..unicast(41003, vec![Some(1)]) };
+    old.add_flow(multicast, 32, 3, None, true).await.unwrap();
+
+    let saved = old.snapshot();
+    assert_eq!(saved.len(), 1, "only the live unicast flow is kept: {saved:?}");
+
+    let (mut new, mut new_rx) = transmitter(2);
+    assert_eq!(new.restore(saved.clone()).await, 1);
+    let index = u32::from_be_bytes(handle[0..4].try_into().unwrap());
+    let cookie = u16::from_be_bytes(handle[4..6].try_into().unwrap());
+    let flow = new.flows.get(&index).expect("flow restored at its old index");
+    assert_eq!(flow.cookie, cookie, "same cookie, so the receiver's handle still matches");
+    assert_eq!(new.ip_port_to_id.get(&"127.0.0.1:41001".parse().unwrap()), Some(&index));
+    assert_eq!(new.flows_info[index as usize].as_ref().unwrap().local_channel_indices, vec![Some(0), Some(1)]);
+    match new_rx.try_recv() {
+      Ok(Command::AddFlow { index: i, needs_keepalives, fpp, bytes_per_sample, .. }) => {
+        assert_eq!((i, needs_keepalives, fpp, bytes_per_sample), (index as usize, true, 32, 3));
+      }
+      other => panic!("expected AddFlow for the TX thread, got {other:?}"),
+    }
+
+    // restoring again finds the slot taken and does not duplicate it
+    assert_eq!(new.restore(saved.clone()).await, 0);
+    // a transmitter that no longer has channel 1 refuses the flow
+    let (mut narrow, _rx) = transmitter(1);
+    assert_eq!(narrow.restore(saved).await, 0);
+    assert!(narrow.flows.is_empty());
   }
 }

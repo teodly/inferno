@@ -9,6 +9,9 @@ use netdev::mac::MacAddr;
 pub struct Channel {
   pub factory_name: String,
   pub friendly_name: Arc<RwLock<String>>, // Arc is needed only because of Clone requirement, TODO: fix the ALSA plugin
+  /// The name is set by the application (FIXED_LAST_CHANNEL_NAME): rename
+  /// requests and saved names never change it.
+  pub fixed_name: bool,
 }
 
 pub type DeviceId = [u8; 8];
@@ -42,11 +45,41 @@ pub struct DeviceInfo {
   pub cmc_port: u16,
   pub flows_control_port: u16,
   pub info_request_port: u16,
+
+  /// Product version announced to controllers (major, minor, patch), e.g.
+  /// the host application's own version; None = this crate's version.
+  pub product_version: Option<(u8, u8, u16)>,
+
+  /// Where a controller's rename request is handed to the host application
+  /// (NAME_REQUEST_PATH); None = renaming from a controller is unsupported.
+  pub name_request_path: Option<std::path::PathBuf>,
+
+  /// Where a controller's receive-latency change is handed to the host
+  /// (LATENCY_REQUEST_PATH, the latency in ns on one line); None = the
+  /// latency cannot be changed from a controller.
+  pub latency_request_path: Option<std::path::PathBuf>,
+
+  /// Where a controller's sample-rate change is handed to the host
+  /// (SAMPLE_RATE_REQUEST_PATH, the rate in Hz on one line); None = the
+  /// sample rate cannot be changed from a controller.
+  pub sample_rate_request_path: Option<std::path::PathBuf>,
+
+  /// The sample rate controllers are told (Hz): sample_rate, or what a
+  /// controller last asked for while the host applies it.
+  pub announced_sample_rate: std::sync::Arc<std::sync::atomic::AtomicU32>,
+
+  /// The receive latency controllers are told (ns): latency_ns, or what a
+  /// controller last asked for while the host applies it.
+  pub announced_latency_ns: Arc<std::sync::atomic::AtomicU32>,
+
+  /// Where saved state (channel names, subscriptions) lives (STATE_DIR);
+  /// None = the per-user state dir plus a per-device-id subdirectory.
+  pub state_dir: Option<std::path::PathBuf>,
 }
 
 impl DeviceInfo {
   pub fn latency_samples(&self) -> usize {
-    self.latency_ns * (self.sample_rate as usize) / 1_000_000_000
+    ((self.latency_ns as u128 * self.sample_rate as u128) / 1_000_000_000u128) as usize
   }
 }
 
@@ -80,6 +113,13 @@ mod tests {
       cmc_port: 0,
       flows_control_port: 0,
       info_request_port: 0,
+      product_version: None,
+      name_request_path: None,
+      latency_request_path: None,
+      sample_rate_request_path: None,
+      announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+      announced_latency_ns: Default::default(),
+      state_dir: None,
     }
   }
 
@@ -118,5 +158,54 @@ mod tests {
     let device = dummy_device_info(1_000_000_000, 44100 * 1024);
     let result = device.latency_samples();
     assert!(result <= usize::MAX);
+  }
+}
+
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+  use netdev::mac::MacAddr;
+
+  fn dummy(latency_ns: usize, sample_rate: u32) -> DeviceInfo {
+    DeviceInfo {
+      ip_address: std::net::Ipv4Addr::UNSPECIFIED,
+      netmask: std::net::Ipv4Addr::UNSPECIFIED,
+      gateway: std::net::Ipv4Addr::UNSPECIFIED,
+      mac_address: MacAddr::zero(),
+      link_speed: 0,
+      board_name: String::new(),
+      manufacturer: String::new(),
+      model_name: String::new(),
+      model_number: String::new(),
+      factory_device_id: [0; 8],
+      process_id: 0,
+      vendor_string: String::new(),
+      friendly_hostname: String::new(),
+      factory_hostname: String::new(),
+      rx_channels: Vec::new(),
+      tx_channels: Vec::new(),
+      bits_per_sample: 0,
+      pcm_type: 0,
+      latency_ns,
+      sample_rate,
+      arc_port: 0,
+      cmc_port: 0,
+      flows_control_port: 0,
+      info_request_port: 0,
+      product_version: None,
+      name_request_path: None,
+      latency_request_path: None,
+      sample_rate_request_path: None,
+      announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+      announced_latency_ns: Default::default(),
+      state_dir: None,
+    }
+  }
+
+  #[test]
+  fn latency_samples_large_values_no_overflow() {
+    let device = dummy(usize::MAX, u32::MAX);
+    let _ = device.latency_samples();
   }
 }

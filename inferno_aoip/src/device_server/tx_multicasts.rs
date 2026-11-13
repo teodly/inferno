@@ -110,10 +110,15 @@ impl TransmitMulticasts {
             .collect_vec(),
           saved.dst_addr,
         )
-        .await;
+        .await
+        .log_and_forget();
     }
   }
-  pub async fn add_flow(&self, flow_index: usize, channel_indices: Vec<Option<usize>>) {
+  pub async fn add_flow(
+    &self,
+    flow_index: usize,
+    channel_indices: Vec<Option<usize>>,
+  ) -> Result<(), std::io::Error> {
     self.add_flow_internal(flow_index, channel_indices, Ipv4Addr::UNSPECIFIED).await
   }
   async fn add_flow_internal(
@@ -121,14 +126,24 @@ impl TransmitMulticasts {
     flow_index: usize,
     channel_indices: Vec<Option<usize>>,
     preferred_address: Ipv4Addr,
-  ) {
+  ) -> Result<(), std::io::Error> {
     info!("adding flow index {flow_index} with local channel indices {channel_indices:?}");
     let bytes_per_sample = (self.self_info.bits_per_sample / 8).try_into().unwrap();
     let dst_addr_arc: Arc<AtomicU32> = Arc::new(0.into());
     let fpp = FPP_MAX_ADVERTISED.try_into().unwrap() /* TODO */;
     let dst = {
       let mut bundles = self.bundles.lock().await;
-      assert!(bundles[flow_index].is_none());
+      match bundles.get(flow_index) {
+        None => {
+          error!("multicast flow index {flow_index} out of range");
+          return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        Some(Some(_)) => {
+          error!("multicast flow index {flow_index} already in use");
+          return Err(std::io::Error::from(std::io::ErrorKind::AddrInUse));
+        }
+        Some(None) => {}
+      }
       let mut flows_tx = self.flows_tx.lock().await;
       let (dst_addr, dst_port) = if let Some(tx) = flows_tx.as_mut() {
         let (dst_addr, dst_port) = if preferred_address.is_unspecified() {
@@ -150,8 +165,7 @@ impl TransmitMulticasts {
           Some(flow_index.try_into().unwrap()),
           true,
         )
-        .await
-        .log_and_forget();
+        .await?;
         info!("added multicast flow, waiting grace period...");
         (dst_addr, dst_port)
       } else {
@@ -188,7 +202,11 @@ impl TransmitMulticasts {
                 break;
               }
               if ok {
-                info!("no multicast conflict detected, activating transmitter");
+                if !flows_tx.activate_multicast_flow(flow_index.try_into().unwrap()) {
+                  warn!("multicast flow id {} was deleted during its grace period", flow_index + 1);
+                  break;
+                }
+                info!("no multicast conflict detected, activated transmitter");
                 dst_addr_arc.store(dst_addr.to_bits(), std::sync::atomic::Ordering::SeqCst);
                 {
                   let mut mcasts = multicasts_by_channel.write().unwrap();
@@ -212,7 +230,6 @@ impl TransmitMulticasts {
                   dst_addr,
                   dst_port,
                 );
-                flows_tx.activate_multicast_flow(flow_index.try_into().unwrap());
 
                 // refresh channels so that multicast will be advertised
                 for index_opt in &channel_indices {
@@ -256,6 +273,7 @@ impl TransmitMulticasts {
         }
       });
     }
+    Ok(())
   }
   pub async fn remove_flow(&self, flow_index: usize) -> Result<(), std::io::Error> {
     self.remove_flow_internal(flow_index, false).await?;
@@ -268,7 +286,7 @@ impl TransmitMulticasts {
     ignore_nonexisting: bool,
   ) -> Result<(), std::io::Error> {
     let mut bundles = self.bundles.lock().await;
-    if let Some(bundle) = bundles[flow_index].take() {
+    if let Some(bundle) = bundles.get_mut(flow_index).and_then(Option::take) {
       let mut flows_tx_opt = self.flows_tx.lock().await;
       if let Some(flows_tx) = flows_tx_opt.as_mut() {
         if !self.should_work.load(std::sync::atomic::Ordering::SeqCst) {
@@ -302,7 +320,7 @@ impl TransmitMulticasts {
         Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
       }
     } else if !ignore_nonexisting {
-      error!("BUG: trying to remove nonexisting multicast TX flow index {flow_index}");
+      error!("trying to remove nonexisting multicast TX flow index {flow_index}");
       Err(std::io::Error::from(std::io::ErrorKind::NotFound))
     } else {
       Ok(())

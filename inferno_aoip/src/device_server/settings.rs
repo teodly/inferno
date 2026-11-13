@@ -30,11 +30,12 @@ fn create_self_info(
           interfaces
             .iter()
             .find(|iface| &iface.name == ipstr)
-            .expect("invalid setting BIND_IP, must contain IP address or network interface name")
-            .ipv4
-            .get(0)
-            .expect("interface specified in BIND_IP has no IPv4 addresses")
-            .addr()
+            .and_then(|iface| iface.ipv4.get(0).map(|n| n.addr()))
+            .unwrap_or_else(|| {
+              log::warn!("invalid BIND_IP {ipstr:?}; falling back to auto-detected IP");
+              // fall back to unspecified; caller will auto-detect below
+              Ipv4Addr::new(0, 0, 0, 0)
+            })
         })
       })
     })
@@ -50,7 +51,9 @@ fn create_self_info(
   settings
     .get("DEVICE_ID")
     .map(|idstr| {
-      hex::decode_to_slice(idstr, &mut devid).expect("invalid DEVICE_ID, should contain hex data");
+      if hex::decode_to_slice(idstr, &mut devid).is_err() {
+        log::warn!("invalid DEVICE_ID {idstr:?}; using generated id");
+      }
     })
     .unwrap_or_else(|| {
       devid[2..6].copy_from_slice(&my_ipv4.octets());
@@ -60,15 +63,15 @@ fn create_self_info(
   // TODO make hostname and sample rate configurable from DC
   let friendly_hostname = settings
     .get("NAME")
-    .map(|s| if s.len() > 31 { s[0..31].to_owned() } else { s.clone() })
+    .map(|s| truncate_utf8(s, 31).to_owned())
     .unwrap_or_else(|| {
       format!(
         "{} {}",
-        if app_name.len() > 22 { &app_name[0..22] } else { &app_name },
+        truncate_utf8(app_name, 22),
         hex::encode(&my_ipv4.octets())
       )
     });
-  let short_app_name = if short_app_name.len() > 14 { &short_app_name[0..14] } else { short_app_name };
+  let short_app_name = truncate_utf8(short_app_name, 14);
 
   let sample_rate = settings
     .get("SAMPLE_RATE")
@@ -139,9 +142,19 @@ fn create_self_info(
     cmc_port: CMC_PORT,
     flows_control_port: FLOWS_CONTROL_PORT,
     info_request_port: INFO_REQUEST_PORT,
+    product_version: settings.get("PRODUCT_VERSION").and_then(|v| parse_product_version(v)),
+    name_request_path: settings.get("NAME_REQUEST_PATH").map(Into::into),
+    latency_request_path: settings.get("LATENCY_REQUEST_PATH").map(Into::into),
+    sample_rate_request_path: settings.get("SAMPLE_RATE_REQUEST_PATH").map(Into::into),
+    announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(sample_rate.try_into().unwrap_or(48000))),
+    announced_latency_ns: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(latency_ns.try_into().unwrap_or(u32::MAX))),
+    state_dir: settings.get("STATE_DIR").map(Into::into),
   };
 
-  if let Some(altport) = settings.get("ALT_PORT").map(|s| s.parse().expect("ALT_PORT must be u16")) {
+  if let Some(altport) = settings.get("ALT_PORT").map(|s| s.parse::<u16>().expect("ALT_PORT must be u16")) {
+    // The three following ports are used too: 65533..=65535 used to
+    // overflow (a panic in debug builds, a wrap to ports 0.. in release).
+    assert!(altport <= u16::MAX - 3, "ALT_PORT must be at most {}", u16::MAX - 3);
     result.arc_port = altport;
     result.cmc_port = altport + 1;
     result.flows_control_port = altport + 2;
@@ -151,13 +164,68 @@ fn create_self_info(
   result
 }
 
+/// The longest prefix of `s` that is at most `max` bytes and ends on a
+/// character boundary. Slicing `&s[0..max]` panicked when byte `max` fell
+/// inside a multi-byte character (a non-ASCII NAME, say).
+fn truncate_utf8(s: &str, max: usize) -> &str {
+  if s.len() <= max {
+    return s;
+  }
+  let mut end = max;
+  while !s.is_char_boundary(end) {
+    end -= 1;
+  }
+  &s[..end]
+}
+
+/// "major.minor.patch" (patch optional) as announced product version
+/// fields; anything else is ignored with a warning.
+pub fn parse_product_version(v: &str) -> Option<(u8, u8, u16)> {
+  let mut parts = v.trim().split('.');
+  let parsed = (|| {
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+      Some(p) => p.parse().ok()?,
+      None => 0,
+    };
+    parts.next().is_none().then_some((major, minor, patch))
+  })();
+  if parsed.is_none() {
+    log::warn!("ignoring PRODUCT_VERSION {v:?}: expected major.minor[.patch]");
+  }
+  parsed
+}
+
+#[cfg(test)]
+mod product_version_tests {
+  use super::parse_product_version;
+
+  #[test]
+  fn parses_dotted_versions() {
+    assert_eq!(parse_product_version("1.20.0"), Some((1, 20, 0)));
+    assert_eq!(parse_product_version(" 2.3 "), Some((2, 3, 0)));
+    assert_eq!(parse_product_version("1.1.300"), Some((1, 1, 300)));
+    for bad in ["", "1", "1.x", "1.2.3.4", "256.0.0", "v1.2.3"] {
+      assert_eq!(parse_product_version(bad), None, "{bad:?}");
+    }
+  }
+}
+
 #[derive(Clone)] // TODO: this shouldn't need to be clonable, fix the ALSA plugin
 pub struct Settings {
   pub self_info: DeviceInfo,
   pub tx_latency_ns: u32,
+  /// MAX_RX_LATENCY_NS: a subscription whose latency (the larger of ours and
+  /// the transmitter's advertised) exceeds this is refused with the "channel latency" status.
+  pub max_rx_latency_ns: u32,
   pub clock_path: Option<PathBuf>,
   pub use_safe_clock: bool,
   pub tx_source_bit_depth: u8,
+  /// FIXED_LAST_CHANNEL_NAME: the last RX and the last TX channel carry this
+  /// name and cannot be renamed (an application's dedicated channel, e.g. a
+  /// timecode channel). None leaves every channel renamable.
+  pub fixed_last_channel_name: Option<String>,
 }
 
 impl Settings {
@@ -186,12 +254,14 @@ impl Settings {
       .unwrap_or(false);
     let tx_source_bit_depth = config
       .get("TX_SOURCE_BIT_DEPTH")
-      .map(|s| s.parse::<u8>().expect("invalid TX_SOURCE_BIT_DEPTH, must be one of: 16, 24, 32"))
+      .map(|s| s.parse::<u8>().unwrap_or(32))
       .unwrap_or(32);
-    assert!(
-      matches!(tx_source_bit_depth, 16 | 24 | 32),
-      "invalid TX_SOURCE_BIT_DEPTH, must be one of: 16, 24, 32"
-    );
+    let tx_source_bit_depth = if matches!(tx_source_bit_depth, 16 | 24 | 32) {
+      tx_source_bit_depth
+    } else {
+      log::warn!("invalid TX_SOURCE_BIT_DEPTH {tx_source_bit_depth}; using 32");
+      32
+    };
 
     let mut result = Self {
       self_info,
@@ -199,9 +269,23 @@ impl Settings {
         .get("TX_LATENCY_NS")
         .map(|p| p.parse().expect("invalid TX_LATENCY_NS, must be integer"))
         .unwrap_or(10_000_000),
+      max_rx_latency_ns: config
+        .get("MAX_RX_LATENCY_NS")
+        .map(|p| p.parse().expect("invalid MAX_RX_LATENCY_NS, must be integer"))
+        .unwrap_or(crate::mdns_client::MAX_ADVERTISED_LATENCY_NS as u32),
       clock_path: config.get("CLOCK_PATH").map(|p| p.try_into().unwrap()),
       use_safe_clock,
       tx_source_bit_depth,
+      fixed_last_channel_name: config
+        .get("FIXED_LAST_CHANNEL_NAME")
+        .filter(|n| {
+          let ok = super::saved_settings::is_valid_channel_name(n);
+          if !ok {
+            log::warn!("ignoring FIXED_LAST_CHANNEL_NAME {n:?}: not a valid channel name");
+          }
+          ok
+        })
+        .cloned(),
     };
 
     // the following should be harmless, as the application still has the chance to overwrite it
@@ -215,19 +299,109 @@ impl Settings {
     result
   }
   pub fn make_rx_channels(&mut self, count: usize) {
-    self.self_info.rx_channels = (1..=count)
-      .map(|id| Channel {
-        factory_name: format!("{id:02}"),
-        friendly_name: Arc::new(RwLock::new(format!("RX {id}"))),
-      })
-      .collect();
+    self.self_info.rx_channels = make_channels("RX", count, self.fixed_last_channel_name.as_deref());
   }
   pub fn make_tx_channels(&mut self, count: usize) {
-    self.self_info.tx_channels = (1..=count)
-      .map(|id| Channel {
+    self.self_info.tx_channels = make_channels("TX", count, self.fixed_last_channel_name.as_deref());
+  }
+}
+
+/// Channels 1..=count named "<prefix> <n>"; with fixed_last, the last one is
+/// named that instead and marked fixed.
+fn make_channels(prefix: &str, count: usize, fixed_last: Option<&str>) -> Vec<Channel> {
+  (1..=count)
+    .map(|id| {
+      let fixed = fixed_last.filter(|_| id == count);
+      Channel {
         factory_name: format!("{id:02}"),
-        friendly_name: Arc::new(RwLock::new(format!("TX {id}"))),
-      })
-      .collect();
+        friendly_name: Arc::new(RwLock::new(fixed.map_or_else(|| format!("{prefix} {id}"), str::to_owned))),
+        fixed_name: fixed.is_some(),
+      }
+    })
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{make_channels, truncate_utf8};
+
+  #[test]
+  fn fixed_last_channel_name() {
+    let chans = make_channels("RX", 3, Some("TIMECODE"));
+    let names: Vec<String> = chans.iter().map(|c| c.friendly_name.read().unwrap().clone()).collect();
+    assert_eq!(names, ["RX 1", "RX 2", "TIMECODE"]);
+    assert_eq!(chans.iter().map(|c| c.fixed_name).collect::<Vec<_>>(), [false, false, true]);
+    assert!(make_channels("TX", 2, None).iter().all(|c| !c.fixed_name));
+    assert!(make_channels("TX", 0, Some("TIMECODE")).is_empty());
+  }
+
+  #[test]
+  fn truncate_utf8_never_splits_a_character() {
+    assert_eq!(truncate_utf8("short", 31), "short");
+    assert_eq!(truncate_utf8("abcdef", 3), "abc");
+    // 'é' is two bytes: byte 3 falls inside the second one
+    assert_eq!(truncate_utf8("aééb", 4), "aé");
+    assert_eq!(truncate_utf8("aééb", 5), "aéé");
+    let name = "Ünïcödé recorder name that is long";
+    let cut = truncate_utf8(name, 31);
+    assert!(cut.len() <= 31 && name.starts_with(cut));
+  }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+
+  #[test]
+  fn truncate_utf8_max_zero() {
+    assert_eq!(truncate_utf8("abc", 0), "");
+  }
+
+  #[test]
+  fn truncate_utf8_empty_input() {
+    assert_eq!(truncate_utf8("", 5), "");
+  }
+
+  #[test]
+  fn parse_product_version_rejects_garbage() {
+    assert_eq!(parse_product_version("1.2.3.4"), None);
+    assert_eq!(parse_product_version("abc"), None);
+    assert_eq!(parse_product_version(""), None);
+  }
+
+  fn latency_settings(pairs: &[(&str, &str)]) -> Settings {
+    let config = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    Settings::new("test", "t", Some(Ipv4Addr::LOCALHOST), &config)
+  }
+
+  #[test]
+  fn latency_defaults() {
+    let s = latency_settings(&[]);
+    assert_eq!(s.self_info.latency_ns, 10_000_000);
+    assert_eq!(s.tx_latency_ns, 10_000_000);
+    assert_eq!(s.max_rx_latency_ns as usize, crate::mdns_client::MAX_ADVERTISED_LATENCY_NS);
+  }
+
+  #[test]
+  fn latency_settings_are_independent() {
+    let s = latency_settings(&[
+      ("RX_LATENCY_NS", "5000000"),
+      ("TX_LATENCY_NS", "1000000"),
+      ("MAX_RX_LATENCY_NS", "20000000"),
+    ]);
+    assert_eq!(s.self_info.latency_ns, 5_000_000);
+    assert_eq!(s.tx_latency_ns, 1_000_000);
+    assert_eq!(s.max_rx_latency_ns, 20_000_000);
+  }
+
+  #[test]
+  #[should_panic(expected = "MAX_RX_LATENCY_NS")]
+  fn invalid_max_rx_latency_is_refused() {
+    latency_settings(&[("MAX_RX_LATENCY_NS", "fast")]);
+  }
+
+  #[test]
+  fn parse_product_version_accepts_two_parts() {
+    assert_eq!(parse_product_version("1.2"), Some((1, 2, 0)));
   }
 }

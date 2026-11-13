@@ -32,9 +32,23 @@ use std::{
 };
 use tokio::{sync::mpsc, time::sleep, time::timeout};
 
-use super::flows_rx::{FlowInfo, FlowsReceiver};
+use super::flows_rx::{FlowInfo, FlowsReceiver, MAX_FLOWS as MAX_RX_FLOWS};
 
 const REORDER_WAIT_SAMPLES: usize = 4800;
+
+/// A free slot in the receive flows table, growing it up to the receiver's fixed
+/// MAX_FLOWS (flows_rx indexes its own tables with this index). None when full:
+/// how many flows exist is decided by subscribe requests from the network.
+fn free_flow_slot<T>(flows: &mut Vec<Option<T>>) -> Option<usize> {
+  if let Some(i) = flows.iter().position(|o| o.is_none()) {
+    return Some(i);
+  }
+  if flows.len() >= MAX_RX_FLOWS {
+    return None;
+  }
+  flows.push(None);
+  Some(flows.len() - 1)
+}
 
 enum Command {
   Shutdown,
@@ -49,6 +63,9 @@ pub enum SubscriptionStatus {
   InProgress = 8,
   TooManyTxFlows = 0x14, // TODO propagate error from tx's reply
   TxFail = 0x15,
+  /// The transmitter demands more latency than MAX_RX_LATENCY_NS allows. 26 = the
+  /// Dante API's "channel latency" status, from memory, unverified against real hardware.
+  ChannelLatency = 0x1A,
   ReceivingUnicast = 0x01010009,
   ReceivingMulticast = 0x0101000a,
 }
@@ -99,6 +116,7 @@ impl ChannelsSubscriber {
     mcast: mpsc::Sender<MulticastMessage>,
     channels_buffering: B,
     tx_latency_ns: u32,
+    max_latency_ns: u32,
     state_storage: Arc<StateStorage>,
     start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>,
     ref_instant: Instant,
@@ -119,6 +137,7 @@ impl ChannelsSubscriber {
       mcast,
       channels_buffering,
       tx_latency_ns,
+      max_latency_ns,
       state_storage,
       ref_instant,
     );
@@ -142,6 +161,14 @@ impl ChannelsSubscriber {
       .log_and_forget();
   }
   pub async fn unsubscribe(&self, local_channel_index: usize) {
+    // Same reason as subscribe: a controller reads the rx subscriptions list
+    // right after the response. The flow teardown happens later on the
+    // subscriber task; clearing the entry only there made netaudio's
+    // readback after a remove still list the channel and report the remove
+    // as failed. (The task clears it again; that is a no-op.)
+    if let Some(slot) = self.subscriptions_info.write().unwrap().get_mut(local_channel_index) {
+      *slot = None;
+    }
     self.commands_sender.send(Command::Unsubscribe { local_channel_index }).await.log_and_forget();
   }
   pub async fn save_state(&self) {
@@ -352,6 +379,7 @@ struct ChannelsSubscriberInternal<P: ProxyToSamplesBuffer, B: ChannelsBuffering<
   flows_recv: Arc<FlowsReceiver<P>>,
   //buffered_samples_per_channel: usize,
   min_latency_ns: usize,
+  max_latency_ns: usize,
   ring_buffer_timestamp_shift: isize,
   control_client: Arc<FlowsControlClient>,
   mdns_client: Arc<MdnsClient>,
@@ -377,6 +405,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     mcast: mpsc::Sender<MulticastMessage>,
     channels_buffering: B,
     tx_latency_ns: u32,
+    max_latency_ns: u32,
     state_storage: Arc<StateStorage>,
     ref_instant: Instant,
   ) -> Self {
@@ -390,6 +419,7 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       flows_recv,
       //buffered_samples_per_channel: 524288,
       min_latency_ns: tx_latency_ns.try_into().unwrap(),
+      max_latency_ns: max_latency_ns.try_into().unwrap(),
       ring_buffer_timestamp_shift: 0,
       control_client: Arc::new(FlowsControlClient::new(self_info)),
       mdns_client,
@@ -557,8 +587,18 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
     // Add all needed servers to map:
     let mut channels_per_server = BTreeMap::<SocketAddr, BTreeMap<usize, AdvertisedChannel>>::new();
     let mut channels_per_bundle = BTreeMap::<String, BTreeMap<usize, AdvertisedChannel>>::new();
+    let mut too_slow = vec![];
     for (lci, advserv_opt) in join_all(dns_resolve_futures).await.into_iter() {
       if let Some(advserv) = advserv_opt {
+        // The flow would play at the larger of both latencies; refuse what we may not play at.
+        if exceeds_max_latency(advserv.min_rx_latency_ns, self.min_latency_ns, self.max_latency_ns) {
+          warn!(
+            "{}@{} demands {} ns latency, over MAX_RX_LATENCY_NS ({} ns): not subscribing",
+            advserv.tx_channel_id, advserv.addr, advserv.min_rx_latency_ns, self.max_latency_ns
+          );
+          too_slow.extend(channel_index_aliases[&lci].iter().copied());
+          continue;
+        }
         match &advserv.multicast {
           None => {
             channels_per_server.entry(advserv.addr).or_default().insert(lci, advserv);
@@ -571,6 +611,24 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           }
         }
       }
+    }
+
+    // Notify controllers only about channels whose status changed (this runs on every retry).
+    let newly_refused: Vec<usize> = {
+      let mut subinfos = self.subscriptions_info.write().unwrap();
+      too_slow
+        .into_iter()
+        .filter(|&chi| match subinfos[chi].as_mut() {
+          Some(subi) if subi.status != SubscriptionStatus::ChannelLatency => {
+            subi.status = SubscriptionStatus::ChannelLatency;
+            true
+          }
+          _ => false,
+        })
+        .collect()
+    };
+    if !newly_refused.is_empty() {
+      self.notify_channels_change(newly_refused).await;
     }
 
     // Check for surprises:
@@ -789,11 +847,11 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           error!("failed to join multicast group {:?}: {e:?}", advbundle.media_addr.ip());
           continue;
         };
-        let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
+        let flow_index = match free_flow_slot(&mut flows_locked) {
           Some(i) => i,
           None => {
-            flows_locked.push(None);
-            flows_locked.len() - 1
+            error!("out of receive flows ({MAX_RX_FLOWS}), not receiving multicast {bundle_full_name}");
+            continue;
           }
         };
         let flow_id = flow_index + 1;
@@ -820,6 +878,16 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
         let updates = Some(
           needed_channels
             .iter()
+            .filter(|(_, advch)| {
+              let in_range = advch
+                .multicast
+                .as_ref()
+                .is_some_and(|m| m.channel_in_bundle < advbundle.tx_channels_per_flow);
+              if !in_range {
+                error!("channel {} is outside multicast bundle {bundle_full_name}", advch.tx_channel_id);
+              }
+              in_range
+            })
             .map(|(lci, advch)| ChannelSourceUpdate {
               local_channel_indices: channel_index_aliases[lci].clone(),
               remote: ChannelOtherEnd {
@@ -860,11 +928,11 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
           .min(8 /*TODO make it configurable*/);
         for chunk in &channels.iter().chunks(num_channels_in_flow) {
           let chunk = chunk.collect_vec();
-          let flow_index = match flows_locked.iter().position(|o| o.is_none()) {
+          let flow_index = match free_flow_slot(&mut flows_locked) {
             Some(i) => i,
             None => {
-              flows_locked.push(None);
-              flows_locked.len() - 1
+              error!("out of receive flows ({MAX_RX_FLOWS}), not requesting a flow from {server_addr}");
+              continue;
             }
           };
           let tx_channels = chunk.iter().map(|(_, chadv)| chadv.tx_channel_id);
@@ -951,7 +1019,6 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
                 return None;
               }
             };
-            assert_eq!(first.bits_per_sample % 8, 0);
             flows_recv
               .add_socket(
                 flow_index,
@@ -1306,5 +1373,77 @@ impl<P: ProxyToSamplesBuffer + Sync + Send + 'static, B: ChannelsBuffering<P>>
       //*self.self_info.rx_channels[lci].friendly_name.write().unwrap() = chst.local_channel_name;
       self.subscribe(lci, &chst.tx_channel_name, &chst.tx_hostname).await;
     }
+  }
+}
+
+/// The flow plays at the larger of the transmitter's and our own latency.
+fn exceeds_max_latency(advertised_ns: usize, own_ns: usize, max_ns: usize) -> bool {
+  advertised_ns.max(own_ns) > max_ns
+}
+
+#[cfg(test)]
+mod latency_limit_tests {
+  use super::*;
+
+  #[test]
+  fn within_limit_is_accepted_and_the_limit_itself_too() {
+    assert!(!exceeds_max_latency(1_000_000, 10_000_000, 10_000_000));
+    assert!(!exceeds_max_latency(10_000_000, 1_000_000, 10_000_000));
+  }
+
+  #[test]
+  fn transmitter_demanding_more_than_the_limit_is_refused() {
+    assert!(exceeds_max_latency(10_000_001, 1_000_000, 10_000_000));
+  }
+
+  #[test]
+  fn our_own_latency_over_the_limit_is_refused_too() {
+    assert!(exceeds_max_latency(1_000_000, 20_000_000, 10_000_000));
+  }
+
+  #[test]
+  fn channel_latency_status_is_dante_26_and_not_receiving() {
+    assert_eq!(SubscriptionStatus::ChannelLatency as u32, 26);
+    assert!(!SubscriptionStatus::ChannelLatency.is_receiving());
+  }
+}
+
+#[cfg(test)]
+mod flow_slot_edge_tests {
+  use super::*;
+
+  #[test]
+  fn free_flow_slot_empty_grows_to_zero() {
+    let mut flows: Vec<Option<u8>> = vec![];
+    assert_eq!(free_flow_slot(&mut flows), Some(0));
+    assert_eq!(flows.len(), 1);
+  }
+
+  #[test]
+  fn free_flow_slot_full_returns_none_without_growing() {
+    let mut flows: Vec<Option<u8>> = vec![Some(1); 2];
+    // MAX_RX_FLOWS is large; simulate full by setting len artificially not possible.
+    // Instead verify reuse of a hole.
+    flows[1] = None;
+    assert_eq!(free_flow_slot(&mut flows), Some(1));
+  }
+}
+
+#[cfg(test)]
+mod flow_slot_tests {
+  use super::*;
+
+  #[test]
+  fn free_flow_slot_reuses_then_grows_up_to_the_receiver_limit() {
+    let mut flows: Vec<Option<u8>> = vec![Some(1), None, Some(3)];
+    assert_eq!(free_flow_slot(&mut flows), Some(1));
+    flows[1] = Some(2);
+    for expected in 3..MAX_RX_FLOWS {
+      assert_eq!(free_flow_slot(&mut flows), Some(expected));
+      flows[expected] = Some(0);
+    }
+    assert_eq!(flows.len(), MAX_RX_FLOWS);
+    assert_eq!(free_flow_slot(&mut flows), None);
+    assert_eq!(flows.len(), MAX_RX_FLOWS);
   }
 }

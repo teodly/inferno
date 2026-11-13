@@ -11,6 +11,25 @@ use super::req_resp::{Connection, HEADER_LENGTH};
 pub const PACKET_SIZE_SOFT_LIMIT: usize = 800;
 pub const PORT: u16 = 4440;
 
+/// Entries per page of the receive channel list (0x3000). Controllers reject
+/// a receive page holding more entries than this.
+pub const RX_CHANNELS_PAGE_SIZE: usize = 16;
+/// Entries per page of the transmit channel lists (0x2000, 0x2010).
+pub const TX_CHANNELS_PAGE_SIZE: usize = 32;
+
+/// A channel-list entry whose non-zero u16 fields named here are offsets into
+/// the packet's string/descriptor area, which follows the entry table.
+pub trait PagedEntry: BinarySerde {
+  /// Move every non-zero heap offset down by `by` bytes.
+  fn shift_heap_offsets(&mut self, by: u16);
+}
+
+fn shift_offset(offset: &mut u16, by: u16) {
+  if *offset != 0 {
+    *offset -= by;
+  }
+}
+
 pub mod channels_and_flows_count {
   use binary_serde::{binary_serde_bitfield, BinarySerde, BitfieldBitOrder};
 
@@ -116,6 +135,15 @@ pub mod get_receive_channels {
     pub subscription_status: u32, // TODO. 0x01010009 if subscribed currently, 0x00000001 if not found but remembers subscription or in progress
     pub unknown2_0: u32,
   }
+
+  impl super::PagedEntry for ChannelDescriptor {
+    fn shift_heap_offsets(&mut self, by: u16) {
+      super::shift_offset(&mut self.common_descriptor_offset, by);
+      super::shift_offset(&mut self.tx_channel_name_offset, by);
+      super::shift_offset(&mut self.tx_hostname_offset, by);
+      super::shift_offset(&mut self.friendly_name_offset, by);
+    }
+  }
 }
 
 pub mod get_transmit_channels {
@@ -130,6 +158,13 @@ pub mod get_transmit_channels {
     pub common_descriptor_offset: u16,
     pub name_offset: u16,
   }
+
+  impl super::PagedEntry for ChannelDescriptor {
+    fn shift_heap_offsets(&mut self, by: u16) {
+      super::shift_offset(&mut self.common_descriptor_offset, by);
+      super::shift_offset(&mut self.name_offset, by);
+    }
+  }
 }
 
 pub mod get_transmit_channels_friendly_names {
@@ -142,6 +177,12 @@ pub mod get_transmit_channels_friendly_names {
     pub channel_id_1: u16,
     pub channel_id_2: u16,
     pub friendly_name_offset: u16,
+  }
+
+  impl super::PagedEntry for ChannelDescriptor {
+    fn shift_heap_offsets(&mut self, by: u16) {
+      super::shift_offset(&mut self.friendly_name_offset, by);
+    }
   }
 }
 
@@ -228,10 +269,82 @@ pub mod create_multicast_tx_flow {
     pub unknown3_1: u16,
     pub unknown4_0: u16,
   }
+
+  /// Parses the flow descriptor at `descr_offset` (relative to the packet start, as
+  /// listed in the request) out of the request content: the header and its channel
+  /// ids (0 = empty slot). None if any part lies outside the content.
+  pub fn parse_descriptor(
+    content: &[u8],
+    descr_offset: usize,
+  ) -> Option<(FlowDescriptorHeader, Vec<u16>)> {
+    use binary_serde::BinarySerde;
+    let start = descr_offset.checked_sub(super::HEADER_LENGTH)?;
+    let header_end = start.checked_add(FlowDescriptorHeader::SERIALIZED_SIZE)?;
+    let header = FlowDescriptorHeader::binary_deserialize(
+      content.get(start..header_end)?,
+      binary_serde::Endianness::Big,
+    )
+    .ok()?;
+    let after_header = &content[header_end..];
+    let channels_len = header.channels_count as usize * 2;
+    if after_header.len() < channels_len + FlowDescriptorFooter::SERIALIZED_SIZE {
+      return None;
+    }
+    let ids =
+      after_header[..channels_len].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+    Some((header, ids))
+  }
 }
 
 pub mod delete_multicast_tx_flow {
   pub const OPCODE: u16 = 0x2202;
+
+  /// Flow ids to delete: `u16 count, u16 ?, count x u16 flow id`. None if the content
+  /// is shorter than its 4-byte header; a count larger than the ids present is clamped.
+  pub fn parse_flow_ids(content: &[u8]) -> Option<Vec<u16>> {
+    if content.len() < 4 {
+      return None;
+    }
+    let count = u16::from_be_bytes([content[0], content[1]]) as usize;
+    Some(content[4..].chunks_exact(2).take(count).map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+  }
+}
+
+/// Remove subscriptions (used by network-audio-controller's `subscription remove`).
+pub mod remove_rx_subscriptions {
+  pub const OPCODE: u16 = 0x3014;
+
+  /// Receive channel ids: `u16 count, count x u32 channel id`. None if the content is
+  /// shorter than its header; a count larger than the ids present is clamped.
+  pub fn parse_channel_ids(content: &[u8]) -> Option<Vec<u32>> {
+    if content.len() < 2 {
+      return None;
+    }
+    let count = u16::from_be_bytes([content[0], content[1]]) as usize;
+    Some(
+      content[2..]
+        .chunks_exact(4)
+        .take(count)
+        .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        .collect(),
+    )
+  }
+
+  /// Splits the requested channel ids (1-based) into local channel indices to
+  /// unsubscribe and ids that name no receive channel. A bulk remove names
+  /// every channel; acting on the first id only left the rest subscribed (U1).
+  pub fn local_channel_indices(ids: &[u32], rx_channels: usize) -> (Vec<usize>, Vec<u32>) {
+    let mut valid = Vec::with_capacity(ids.len());
+    let mut invalid = Vec::new();
+    for &id in ids {
+      if id == 0 || id as usize > rx_channels {
+        invalid.push(id);
+      } else {
+        valid.push((id - 1) as usize);
+      }
+    }
+    (valid, invalid)
+  }
 }
 
 pub mod query_rx_flows {
@@ -328,6 +441,81 @@ where
   (have_more, bytes.as_bytes()[HEADER_LENGTH..].into())
 }
 
+/// Like `serialize_items`, but the entry table is packed: it holds exactly
+/// the entries sent, with the string/descriptor area right after it.
+/// `serialize_items` reserves `space_items` slots up front, so a short page
+/// (the last page of a list, or one cut by `PACKET_SIZE_SOFT_LIMIT`) carries
+/// zeroed slots between the table and the strings, which controllers reject
+/// as a malformed page.
+pub fn serialize_page<InItem, OutItem>(
+  space_items: u8,
+  source: impl IntoIterator<Item = InItem>,
+  mut transform: impl FnMut(InItem, &mut ByteBuffer) -> Option<OutItem>,
+) -> (bool, Vec<u8>)
+where
+  OutItem: PagedEntry,
+{
+  let mut bytes = ByteBuffer::new();
+  bytes.write_bytes(&[0u8; HEADER_LENGTH]);
+  bytes.write_u8(space_items);
+  bytes.write_u8(0);
+  if space_items == 0 {
+    return (false, bytes.as_bytes()[HEADER_LENGTH..].into());
+  }
+  let space_items: usize = space_items.into();
+  // one past the page tells whether more entries follow it
+  let mut source: Vec<InItem> = source.into_iter().take(space_items + 1).collect();
+  let mut have_more = source.len() > space_items;
+  source.truncate(space_items);
+  let table_start = 2 + HEADER_LENGTH;
+  let reserved = source.len();
+  bytes.write_bytes(&vec![0u8; reserved * OutItem::SERIALIZED_SIZE]);
+
+  let mut items = Vec::with_capacity(reserved);
+  // End of the data the emitted entries own. The transform writes an
+  // entry's strings and descriptors before the size check, so an entry
+  // that crosses the limit has already appended its data: the page is cut
+  // where that data began, or it would carry bytes no entry points to
+  // (and run past the soft limit by up to one entry's data). Safe because
+  // the rejected entry is never the first, so data it shares with earlier
+  // entries (the common descriptor) was written before it.
+  let mut heap_end = bytes.get_wpos();
+  for in_item in source {
+    let entry_start = bytes.get_wpos();
+    let out_item = match transform(in_item, &mut bytes) {
+      Some(item) => item,
+      None => continue,
+    };
+    // as in serialize_items, the entry that crosses the limit goes on the next page
+    if bytes.get_wpos() >= PACKET_SIZE_SOFT_LIMIT && !items.is_empty() {
+      have_more = true;
+      heap_end = entry_start;
+      break;
+    }
+    items.push(out_item);
+    heap_end = bytes.get_wpos();
+  }
+
+  let gap = (reserved - items.len()) * OutItem::SERIALIZED_SIZE;
+  let table_end = table_start + reserved * OutItem::SERIALIZED_SIZE;
+  let raw = bytes.as_bytes();
+  let mut out = Vec::with_capacity(raw.len() - gap - HEADER_LENGTH);
+  // Both bytes carry the number of entries in this page. A controller reads
+  // a receive page whose first byte is larger than its entry count as
+  // malformed; for a full page, and for every single-page list, this is the
+  // value inferno always sent.
+  out.push(items.len().try_into().unwrap());
+  out.push(items.len().try_into().unwrap());
+  let mut tmp_buffer = vec![0u8; OutItem::SERIALIZED_SIZE];
+  for mut item in items {
+    item.shift_heap_offsets(gap.try_into().unwrap());
+    item.binary_serialize(&mut tmp_buffer, binary_serde::Endianness::Big);
+    out.extend_from_slice(&tmp_buffer);
+  }
+  out.extend_from_slice(&raw[table_end..heap_end]);
+  (have_more, out)
+}
+
 pub fn extract_start_index(request_payload: &[u8]) -> Option<usize> {
   if request_payload.len() < 4 || (request_payload[2] | request_payload[3]) == 0 {
     error!("got invalid paginate request, payload: {request_payload:?}");
@@ -358,6 +546,7 @@ where
   (code, bytes)
 }
 
+/// Responds with one page of a channel list (packed, see `serialize_page`).
 pub async fn paginate_respond<InItem, OutItem>(
   connection: &mut Connection,
   request_payload: &[u8],
@@ -365,9 +554,18 @@ pub async fn paginate_respond<InItem, OutItem>(
   source: impl IntoIterator<Item = InItem>,
   transform: impl FnMut(InItem, &mut ByteBuffer) -> Option<OutItem>,
 ) where
-  OutItem: BinarySerde,
+  OutItem: PagedEntry,
 {
-  let (code, bytes) = paginate_make_response(connection, request_payload, space_items, source, transform);
+  let start_index = match extract_start_index(request_payload) {
+    Some(v) => v,
+    None => {
+      error!("unable to extract start index from request payload {}", hex::encode(request_payload));
+      connection.respond_with_code(0xFFFF /* TODO */, &[]).await;
+      return;
+    }
+  };
+  let (have_more, bytes) = serialize_page(space_items, source.into_iter().skip(start_index), transform);
+  let code = if have_more { 0x8112 } else { 1 };
   connection.respond_with_code(code, &bytes).await;
 }
 
@@ -404,11 +602,15 @@ impl<'a, T: BinarySerde> Iterator for ItemsInPacketIterator<'a, T> {
   }
 }
 
+/// Iterates the items of a request payload laid out as `u8, u8 count, count x T`.
+/// The count comes from the network: it is clamped to the items actually present,
+/// and a payload shorter than its 2-byte header yields no items.
 pub fn deserialize_items<'a, T: BinarySerde>(payload: &'a [u8]) -> ItemsInPacketIterator<'a, T> {
+  let items_bytes = payload.get(2..).unwrap_or(&[]);
   let num_items: usize = (*payload.get(1).unwrap_or(&0)).into();
-  let num_items = num_items.min(payload.len() / T::SERIALIZED_SIZE);
+  let num_items = num_items.min(items_bytes.len() / T::SERIALIZED_SIZE);
   ItemsInPacketIterator::<'a, T> {
-    items_bytes: &payload[2..][..num_items * T::SERIALIZED_SIZE],
+    items_bytes: &items_bytes[..num_items * T::SERIALIZED_SIZE],
     item_start: 0,
     _t: Default::default(),
   }
@@ -498,6 +700,13 @@ mod tests {
       cmc_port: 8800,
       flows_control_port: 4455,
       info_request_port: 8700,
+      product_version: None,
+      name_request_path: None,
+      latency_request_path: None,
+      sample_rate_request_path: None,
+      announced_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+      announced_latency_ns: Default::default(),
+      state_dir: None,
     };
     let desc = CommonChannelsDescriptor::new(&device);
     assert_eq!(desc.sample_rate, 48000);
@@ -641,5 +850,233 @@ mod tests {
   fn deserialize_items_empty() {
     let items: Vec<get_receive_channels::ChannelDescriptor> = deserialize_items(&[0, 0]).collect();
     assert!(items.is_empty());
+  }
+
+  #[test]
+  fn remove_rx_subscriptions_parse() {
+    use remove_rx_subscriptions::parse_channel_ids;
+    // netaudio, two channels: u16 count, then u32 ids
+    assert_eq!(parse_channel_ids(&[0, 2, 0, 0, 0, 1, 0, 0, 0, 2]), Some(vec![1, 2]));
+    // the single-channel example from the original handler's comment
+    assert_eq!(parse_channel_ids(&[0, 1, 0, 0, 0, 2]), Some(vec![2]));
+    assert_eq!(parse_channel_ids(&[]), None);
+    assert_eq!(parse_channel_ids(&[0]), None);
+    // count larger than the ids present (the old handler read content[4..6] unchecked)
+    assert_eq!(parse_channel_ids(&[0xff, 0xff, 0, 0]), Some(vec![]));
+    assert_eq!(parse_channel_ids(&[0, 3, 0, 0, 0, 7, 0]), Some(vec![7]));
+  }
+
+  #[test]
+  fn bulk_unsubscribe_takes_every_channel() {
+    use remove_rx_subscriptions::{local_channel_indices, parse_channel_ids};
+    // netaudio's bulk remove of channels 1-3 on a 32-channel receiver
+    let ids = parse_channel_ids(&[0, 3, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3]).unwrap();
+    assert_eq!(local_channel_indices(&ids, 32), (vec![0, 1, 2], vec![]));
+    // ids outside the device are reported, the rest still handled
+    assert_eq!(local_channel_indices(&[0, 2, 33], 32), (vec![1], vec![0, 33]));
+  }
+
+  #[test]
+  fn delete_multicast_tx_flow_parse() {
+    use delete_multicast_tx_flow::parse_flow_ids;
+    assert_eq!(parse_flow_ids(&[0, 2, 0, 0, 0, 1, 0, 5]), Some(vec![1, 5]));
+    for len in 0..4 {
+      assert_eq!(parse_flow_ids(&[0, 2, 0, 0][..len]), None, "len {len}");
+    }
+    assert_eq!(parse_flow_ids(&[0xff, 0xff, 0, 0, 0, 9, 1]), Some(vec![9]));
+  }
+
+  #[test]
+  fn create_multicast_tx_flow_parse() {
+    use create_multicast_tx_flow::*;
+    // content: u16 ?, u16 count=1, u16 descriptor offset (packet-relative), then the descriptor
+    let mut content = vec![0u8, 1, 0, (HEADER_LENGTH + 6) as u8];
+    content.extend_from_slice(&[0, 0]);
+    let header =
+      FlowDescriptorHeader { flow_id: 3, flow_type: 2, unknown1_0: [0; 10], channels_count: 2 };
+    content.extend_from_slice(header.binary_serialize_to_array(binary_serde::Endianness::Big).as_slice());
+    content.extend_from_slice(&[0, 1, 0, 4]); // channel ids 1, 4
+    content.extend_from_slice(&[0, 0]); // footer
+    let (h, ids) = parse_descriptor(&content, HEADER_LENGTH + 6).unwrap();
+    assert_eq!((h.flow_id, h.flow_type, h.channels_count), (3, 2, 2));
+    assert_eq!(ids, vec![1, 4]);
+    // offsets below the header length used to underflow `descr_offset - HEADER_LENGTH`
+    for offset in 0..HEADER_LENGTH {
+      assert!(parse_descriptor(&content, offset).is_none(), "offset {offset}");
+    }
+    assert!(parse_descriptor(&content, usize::MAX).is_none());
+    // every truncation is rejected; the old length check compared the channel *count*
+    // with the bytes left, so a list of 2-byte ids could run past the end
+    for len in 0..content.len() {
+      assert!(parse_descriptor(&content[..len], HEADER_LENGTH + 6).is_none(), "len {len}");
+    }
+    let mut many = content.clone();
+    let count_pos = 6 + FlowDescriptorHeader::SERIALIZED_SIZE - 2;
+    many[count_pos..count_pos + 2].copy_from_slice(&3u16.to_be_bytes());
+    assert!(parse_descriptor(&many, HEADER_LENGTH + 6).is_none());
+  }
+
+  #[test]
+  fn deserialize_items_shorter_than_header() {
+    for payload in [&[][..], &[0][..], &[0, 5][..]] {
+      let items: Vec<u16> = deserialize_items(payload).collect();
+      assert!(items.is_empty(), "payload {payload:?}");
+    }
+  }
+
+  #[test]
+  fn deserialize_items_count_larger_than_payload() {
+    // count says 5 items of 6 bytes, but only 5 bytes follow the header:
+    // the old code took the count from the whole payload (7 / 6 = 1) and sliced past the end
+    let payload = [0, 5, 1, 2, 3, 4, 5];
+    let items: Vec<set_channels_subscriptions::SingleChannelSubscriptionRequest> =
+      deserialize_items(&payload).collect();
+    assert!(items.is_empty());
+  }
+
+  #[test]
+  fn deserialize_items_clamps_to_present_items() {
+    let payload = [0, 200, 0, 1, 0, 2, 0, 3];
+    let items: Vec<u16> = deserialize_items(&payload).collect();
+    assert_eq!(items, vec![1, 2, 3]);
+  }
+
+  #[test]
+  fn deserialize_items_never_panics_on_short_payloads() {
+    for len in 0..64 {
+      for count in [0u8, 1, 2, 7, 255] {
+        let mut payload = vec![0xAAu8; len];
+        if len > 1 {
+          payload[1] = count;
+        }
+        let _: Vec<set_channels_subscriptions::SingleChannelSubscriptionRequest> =
+          deserialize_items(&payload).collect();
+        let _: Vec<u16> = deserialize_items(&payload).collect();
+      }
+    }
+  }
+
+  // --- U13: packed channel-list pages -------------------------------------
+
+  fn tx_page(channels: usize, start_index: usize) -> (bool, Vec<u8>) {
+    use crate::byte_utils::write_0term_str_to_bytebuffer;
+    let names: Vec<String> = (1..=channels).map(|i| format!("{i:02}")).collect();
+    let mut descriptor_offset = 0u16;
+    serialize_page(
+      channels.min(TX_CHANNELS_PAGE_SIZE).try_into().unwrap(),
+      names.iter().enumerate().skip(start_index),
+      |(index, name), bytes| {
+        if descriptor_offset == 0 {
+          descriptor_offset = bytes.get_wpos().try_into().unwrap();
+          bytes.write_u32(48000);
+        }
+        Some(get_transmit_channels::ChannelDescriptor {
+          channel_id: (index + 1).try_into().unwrap(),
+          unknown1_7: 7,
+          common_descriptor_offset: descriptor_offset,
+          name_offset: write_0term_str_to_bytebuffer(bytes, name),
+        })
+      },
+    )
+  }
+
+  // every offset in an entry must point at what the transform wrote there,
+  // and the string area must start right after the last entry
+  fn check_packed(body: &[u8]) {
+    let size = get_transmit_channels::ChannelDescriptor::SERIALIZED_SIZE;
+    let count = body[1] as usize;
+    let table_end = HEADER_LENGTH + 2 + count * size;
+    for i in 0..count {
+      let e = 2 + i * size;
+      let id = u16::from_be_bytes([body[e], body[e + 1]]);
+      let descr = u16::from_be_bytes([body[e + 4], body[e + 5]]) as usize;
+      let name = u16::from_be_bytes([body[e + 6], body[e + 7]]) as usize;
+      assert_eq!(descr, table_end, "descriptor follows the table");
+      let at = name - HEADER_LENGTH;
+      let end = at + body[at..].iter().position(|&b| b == 0).unwrap();
+      assert_eq!(std::str::from_utf8(&body[at..end]).unwrap(), format!("{id:02}"));
+    }
+  }
+
+  #[test]
+  fn short_last_page_is_packed() {
+    // 33 channels: page 2 holds one entry of a 32-entry page
+    let (more, body) = tx_page(33, 32);
+    assert!(!more);
+    assert_eq!(body[0], 1, "first byte is the entry count");
+    assert_eq!(body[1], 1);
+    check_packed(&body);
+    assert_eq!(body.len(), 2 + 8 + 4 + 3, "no reserved slots left in the packet");
+  }
+
+  #[test]
+  fn full_pages_report_more() {
+    let (more, body) = tx_page(64, 0);
+    assert!(more);
+    assert_eq!(body[1], 32);
+    check_packed(&body);
+    let (more, body) = tx_page(64, 32);
+    assert!(!more);
+    assert_eq!(body[1], 32);
+    check_packed(&body);
+  }
+
+  #[test]
+  fn soft_limit_cut_page_is_packed() {
+    use crate::byte_utils::write_0term_str_to_bytebuffer;
+    // long names push the page over PACKET_SIZE_SOFT_LIMIT before 32 entries
+    let names: Vec<String> = (1..=32).map(|i| format!("{i:02}{}", "x".repeat(40))).collect();
+    let (more, body) = serialize_page(32, names.iter().enumerate(), |(index, name), bytes| {
+      Some(get_transmit_channels_friendly_names::ChannelDescriptor {
+        channel_id_1: (index + 1).try_into().unwrap(),
+        channel_id_2: (index + 1).try_into().unwrap(),
+        friendly_name_offset: write_0term_str_to_bytebuffer(bytes, name),
+      })
+    });
+    assert!(more);
+    let count = body[1] as usize;
+    assert!(count > 0 && count < 32);
+    let table_end = HEADER_LENGTH + 2 + count * 6;
+    let first_name = u16::from_be_bytes([body[6], body[7]]) as usize;
+    assert_eq!(first_name, table_end);
+    assert!(body.len() + HEADER_LENGTH < PACKET_SIZE_SOFT_LIMIT + 64);
+  }
+
+  #[test]
+  fn soft_limit_cut_page_has_no_orphaned_bytes() {
+    use crate::byte_utils::write_0term_str_to_bytebuffer;
+    // The entry that crosses PACKET_SIZE_SOFT_LIMIT goes on the next page;
+    // the name it already wrote must not stay behind in this one.
+    let names: Vec<String> = (1..=32).map(|i| format!("{i:02}{}", "x".repeat(40))).collect();
+    let (more, body) = serialize_page(32, names.iter().enumerate(), |(index, name), bytes| {
+      Some(get_transmit_channels_friendly_names::ChannelDescriptor {
+        channel_id_1: (index + 1).try_into().unwrap(),
+        channel_id_2: (index + 1).try_into().unwrap(),
+        friendly_name_offset: write_0term_str_to_bytebuffer(bytes, name),
+      })
+    });
+    assert!(more);
+    let count = body[1] as usize;
+    // every byte after the table belongs to an emitted entry's name: the
+    // packet ends with the last emitted name's terminator
+    let last = 2 + (count - 1) * 6;
+    let last_name = u16::from_be_bytes([body[last + 4], body[last + 5]]) as usize - HEADER_LENGTH;
+    let end = last_name + names[count - 1].len() + 1;
+    assert_eq!(body.len(), end, "bytes after the last emitted entry's data");
+    assert_eq!(&body[last_name..end - 1], names[count - 1].as_bytes());
+    assert!(body.len() + HEADER_LENGTH < PACKET_SIZE_SOFT_LIMIT + 64);
+  }
+
+  #[test]
+  fn receive_pages_hold_at_most_16_entries() {
+    // the unit's 32-channel receive list must go out as two full pages of 16,
+    // not one page of 24 followed by zeroed slots
+    assert_eq!(RX_CHANNELS_PAGE_SIZE, 16);
+    let page: u8 = 32usize.min(RX_CHANNELS_PAGE_SIZE).try_into().unwrap();
+    let (more, body) = serialize_page(page, 0..32u16, |i, _| {
+      Some(get_receive_channels::ChannelDescriptor { channel_id: i + 1, ..Default::default() })
+    });
+    assert!(more);
+    assert_eq!((body[0], body[1]), (16, 16));
   }
 }

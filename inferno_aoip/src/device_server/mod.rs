@@ -24,6 +24,43 @@ use tokio::sync::{broadcast as broadcast_queue, mpsc, watch, Mutex};
 use crate::common::*;
 use crate::device_info::DeviceInfo;
 
+/// Runs a request server and starts it again (after a growing pause) if it
+/// panics. The servers parse packets from any host on the network; their
+/// parsers are bounds-checked, and this keeps one unforeseen panic from taking
+/// the service down until the process restarts. A panicked task drops its
+/// socket while unwinding, so the restarted one can bind the same port.
+async fn supervise<F, Fut>(name: &'static str, mut shutdown: broadcast_queue::Receiver<()>, start: F)
+where
+  F: Fn(broadcast_queue::Receiver<()>) -> Fut,
+  Fut: Future<Output = ()> + Send + 'static,
+{
+  const FIRST_PAUSE: Duration = Duration::from_millis(100);
+  const MAX_PAUSE: Duration = Duration::from_secs(5);
+  const HEALTHY_RUN: Duration = Duration::from_secs(60);
+  let mut pause = FIRST_PAUSE;
+  loop {
+    let started = Instant::now();
+    match tokio::spawn(start(shutdown.resubscribe())).await {
+      Ok(()) => return, // normal exit: shutdown
+      Err(e) if e.is_panic() => {
+        if started.elapsed() > HEALTHY_RUN {
+          pause = FIRST_PAUSE;
+        }
+        error!("{name} panicked, restarting it in {pause:?}");
+        tokio::select! {
+          _ = shutdown.recv() => return,
+          _ = tokio::time::sleep(pause) => {}
+        }
+        pause = (pause * 2).min(MAX_PAUSE);
+      }
+      Err(e) => {
+        error!("{name} task ended unexpectedly: {e}");
+        return;
+      }
+    }
+  }
+}
+
 pub(crate) mod arc_server;
 pub(crate) mod cmc_server;
 pub(crate) mod flows_control_server;
@@ -34,6 +71,7 @@ pub(crate) mod channels_subscriber;
 pub(crate) mod flows_rx;
 pub(crate) mod flows_tx;
 mod peaks;
+pub(crate) mod metering;
 pub(crate) mod samples_collector;
 pub(crate) mod samples_utils;
 pub(crate) mod saved_settings;
@@ -58,6 +96,70 @@ pub struct TransferNotifier {
   pub max_interval_samples: Clock,
 }
 
+/// Rate limit for TransferNotifier callbacks from the realtime loops.
+///
+/// The RX and TX loops used to notify on every iteration, i.e. every packet
+/// (thousands per second with a few flows). Each callback wakes the
+/// application's blocked ALSA read or write, which finds less than a period
+/// available and sleeps again: at 2 channels that churn was most of an idle
+/// recorder's CPU. A quarter of max_interval_samples (the ALSA period)
+/// between notifications still wakes the application well before each
+/// period is complete.
+pub(crate) struct NotifyThrottle {
+  interval: Duration,
+  next: Instant,
+}
+
+impl NotifyThrottle {
+  pub(crate) fn new(max_interval_samples: Clock, sample_rate: u32) -> Self {
+    let interval =
+      Duration::from_nanos(max_interval_samples as u64 * 1_000_000_000 / 4 / (sample_rate.max(1) as u64));
+    Self { interval, next: Instant::now() }
+  }
+
+  /// Whether a notification is due at `now`; if so, the next one is due an
+  /// interval later.
+  pub(crate) fn due(&mut self, now: Instant) -> bool {
+    if now < self.next {
+      return false;
+    }
+    self.next = now + self.interval;
+    true
+  }
+}
+
+#[cfg(test)]
+mod notify_throttle_tests {
+  use super::*;
+
+  #[test]
+  fn spaces_notifications_by_a_quarter_period() {
+    let mut t = NotifyThrottle::new(1024, 48000); // 21.3ms period -> 5.33ms
+    let t0 = Instant::now();
+    t.next = t0;
+    assert!(t.due(t0), "first call notifies");
+    assert!(!t.due(t0 + Duration::from_millis(1)));
+    assert!(!t.due(t0 + Duration::from_millis(5)));
+    assert!(t.due(t0 + Duration::from_micros(5334)));
+    // Spacing restarts from the notification, not from a fixed grid, so
+    // a late loop iteration never produces a burst.
+    assert!(t.due(t0 + Duration::from_millis(50)));
+    assert!(!t.due(t0 + Duration::from_millis(51)));
+    assert!(t.due(t0 + Duration::from_micros(55334)));
+  }
+
+  #[test]
+  fn bounds_the_rate_of_a_per_packet_loop() {
+    // 3000 iterations a second for one second notify under 190 times (the
+    // quarter period rounds up to whole iterations), not 3000.
+    let mut t = NotifyThrottle::new(1024, 48000);
+    let t0 = Instant::now();
+    t.next = t0;
+    let n = (0..3000).filter(|i| t.due(t0 + Duration::from_micros(i * 333))).count();
+    assert!((170..=190).contains(&n), "{n} notifications");
+  }
+}
+
 pub struct DeviceServer {
   pub self_info: Arc<DeviceInfo>,
   ref_instant: Instant,
@@ -68,6 +170,7 @@ pub struct DeviceServer {
   mdns_server: Arc<DeviceMDNSResponder>,
   mcast_tx: mpsc::Sender<crate::protocol::mcast::MulticastMessage>,
   tx_latency_ns: u32,
+  max_rx_latency_ns: u32,
   tx_source_bit_depth: u8,
   channels_sub_tx: watch::Sender<Option<Arc<ChannelsSubscriber>>>,
   channels_subscriber: Option<Arc<ChannelsSubscriber>>,
@@ -78,6 +181,8 @@ pub struct DeviceServer {
   tx_peaks_supplier: Arc<RwLock<Box<dyn Fn() -> Vec<u8> + Send + Sync>>>,
   shutdown_todo: Pin<Box<dyn Future<Output = ()> + Send>>,
   tx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+  /// Unicast flows of the last stopped transmitter, restored by the next.
+  saved_tx_flows: Arc<std::sync::Mutex<Vec<flows_tx::SavedFlow>>>,
   rx_shutdown_todo: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 }
 
@@ -93,6 +198,7 @@ impl DeviceServer {
     let tx_multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>> = Default::default();
     let mdns_handle = Arc::new(mdns_server::DeviceMDNSResponder::start(
       self_info.clone(),
+      settings.tx_latency_ns,
       tx_multicasts_by_channel.clone(),
     ));
 
@@ -121,17 +227,35 @@ impl DeviceServer {
     let flows_tx: Arc<Mutex<Option<FlowsTransmitter>>> = Default::default();
     let tx_multicasts: Arc<Mutex<Option<TransmitMulticasts>>> = Default::default();
     tasks.append(&mut vec![
-      tokio::spawn(arc_server::run_server(
-        self_info.clone(),
-        state_storage.clone(),
-        mdns_handle.clone(),
-        mcast_tx.clone(),
-        channels_sub_rx.clone(),
-        flows_tx.clone(),
-        tx_multicasts.clone(),
-        shdn_recv1,
-      )),
-      tokio::spawn(cmc_server::run_server(self_info.clone(), shdn_recv2)),
+      tokio::spawn({
+        let (self_info, state_storage, mdns_handle, mcast_tx, channels_sub_rx, flows_tx, tx_multicasts) = (
+          self_info.clone(),
+          state_storage.clone(),
+          mdns_handle.clone(),
+          mcast_tx.clone(),
+          channels_sub_rx.clone(),
+          flows_tx.clone(),
+          tx_multicasts.clone(),
+        );
+        supervise("ARC server", shdn_recv1, move |shutdown| {
+          arc_server::run_server(
+            self_info.clone(),
+            state_storage.clone(),
+            mdns_handle.clone(),
+            mcast_tx.clone(),
+            channels_sub_rx.clone(),
+            flows_tx.clone(),
+            tx_multicasts.clone(),
+            shutdown,
+          )
+        })
+      }),
+      tokio::spawn({
+        let self_info = self_info.clone();
+        supervise("CMC server", shdn_recv2, move |shutdown| {
+          cmc_server::run_server(self_info.clone(), shutdown)
+        })
+      }),
       tokio::spawn(info_mcast_server::run_server(
         self_info.clone(),
         mcast_rx,
@@ -164,6 +288,7 @@ impl DeviceServer {
       mdns_server,
       mcast_tx,
       tx_latency_ns: settings.tx_latency_ns,
+      max_rx_latency_ns: settings.max_rx_latency_ns,
       tx_source_bit_depth: settings.tx_source_bit_depth,
       channels_sub_tx,
       channels_subscriber: None,
@@ -177,6 +302,7 @@ impl DeviceServer {
       shutdown_todo,
       rx_shutdown_todo: None,
       tx_shutdown_todo: None,
+      saved_tx_flows: Default::default(),
     }
   }
 
@@ -250,7 +376,10 @@ impl DeviceServer {
       self.mdns_client.clone(),
       self.mcast_tx.clone(),
       channels_buffering,
-      self.tx_latency_ns, /* FIXME should be RX latency */
+      // The receiver's own minimum latency is RX_LATENCY_NS (it used the
+      // transmit latency, so RX_LATENCY_NS was announced but never used).
+      self.self_info.latency_ns.try_into().unwrap_or(u32::MAX),
+      self.max_rx_latency_ns,
       self.state_storage.clone(),
       srx2,
       self.ref_instant,
@@ -300,7 +429,7 @@ impl DeviceServer {
   ) {
     let clock_rx = self.clock_receiver.subscribe();
 
-    let (flows_tx_handle, flows_tx_thread) = flows_tx::FlowsTransmitter::start(
+    let (mut flows_tx_handle, flows_tx_thread) = flows_tx::FlowsTransmitter::start(
       self.self_info.clone(),
       self.tx_latency_ns.try_into().unwrap(),
       self.tx_source_bit_depth,
@@ -310,6 +439,15 @@ impl DeviceServer {
       current_timestamp.clone(),
       on_transfer,
     );
+    // A transmitter restart (the ALSA plugin restarts it to recover from an
+    // underrun) used to drop every flow: each receiver went silent until
+    // its keepalive timed out and it re-requested, ~4-5 s later. Re-create
+    // the previous transmitter's unicast flows with the same handles.
+    let saved = std::mem::take(&mut *self.saved_tx_flows.lock().unwrap());
+    if !saved.is_empty() {
+      let restored = flows_tx_handle.restore(saved).await;
+      info!("transmitter restarted with {restored} flow(s) kept");
+    }
     *self.flows_tx.lock().await = Some(flows_tx_handle);
     let txm = TransmitMulticasts::new(
       self.tx_multicasts_by_channel.clone(),
@@ -326,11 +464,12 @@ impl DeviceServer {
       self.mdns_server.add_tx_channel(index);
     }
     let (shutdown_send, shutdown_recv) = broadcast_queue::channel(16);
-    let flows_control_task = tokio::spawn(flows_control_server::run_server(
-      self.self_info.clone(),
-      self.flows_tx.clone(),
-      shutdown_recv,
-    ));
+    let flows_control_task = tokio::spawn({
+      let (self_info, flows_tx) = (self.self_info.clone(), self.flows_tx.clone());
+      supervise("flow control server", shutdown_recv, move |shutdown| {
+        flows_control_server::run_server(self_info.clone(), flows_tx.clone(), shutdown)
+      })
+    });
     //let peaks_work = Arc::new(AtomicBool::new(true));
     //let peaks_work1 = peaks_work.clone();
     //let peaks = self.tx_peaks.clone();
@@ -355,6 +494,7 @@ impl DeviceServer {
     }).unwrap(); */
     let flows_tx = self.flows_tx.clone();
     let tx_multicasts = self.tx_multicasts.clone();
+    let saved_tx_flows = self.saved_tx_flows.clone();
     self.tx_shutdown_todo = Some(
       async move {
         //peaks_work1.store(false, Ordering::Relaxed);
@@ -363,6 +503,10 @@ impl DeviceServer {
         }
         shutdown_send.send(()).unwrap();
         flows_control_task.await.unwrap();
+        // keep the flows for the next transmitter (see transmit)
+        if let Some(ftx) = flows_tx.lock().await.as_ref() {
+          *saved_tx_flows.lock().unwrap() = ftx.snapshot();
+        }
         *flows_tx.lock().await = None;
         flows_tx_thread.join().unwrap();
         //peaks_thread.join().unwrap();
@@ -409,5 +553,49 @@ impl DeviceServer {
     self.shutdown_todo.await;
     self.clock_receiver.stop().await.unwrap();
     info!("shutdown ok");
+  }
+}
+
+#[cfg(test)]
+mod supervise_tests {
+  use super::*;
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  #[tokio::test]
+  async fn restarts_a_panicking_server_and_stops_on_shutdown() {
+    let (shutdown_send, shutdown_recv) = broadcast_queue::channel(4);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let s = starts.clone();
+    let supervisor = tokio::spawn(supervise("test server", shutdown_recv, move |mut shutdown| {
+      let n = s.fetch_add(1, Ordering::SeqCst);
+      async move {
+        if n < 2 {
+          panic!("simulated malformed packet");
+        }
+        let _ = shutdown.recv().await;
+      }
+    }));
+    // two panics: pauses of 100 ms and 200 ms before the third start
+    for _ in 0..100 {
+      if starts.load(Ordering::SeqCst) >= 3 {
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 3);
+    shutdown_send.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
+    assert_eq!(starts.load(Ordering::SeqCst), 3, "not restarted after a normal exit");
+  }
+
+  #[tokio::test]
+  async fn shutdown_during_restart_pause_stops_it() {
+    let (shutdown_send, shutdown_recv) = broadcast_queue::channel(4);
+    let supervisor = tokio::spawn(supervise("test server", shutdown_recv, |_shutdown| async {
+      panic!("always");
+    }));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    shutdown_send.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), supervisor).await.unwrap().unwrap();
   }
 }

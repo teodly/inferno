@@ -2,6 +2,9 @@ use crate::device_info::DeviceId;
 
 pub const PORT: u16 = 8800;
 
+/// Legacy discovery plane start code observed in the field (Yamaha DSP probes).
+pub const LEGACY_START_CODE: u16 = 0x1200;
+
 #[derive(Debug, binary_serde::BinarySerde, Default)]
 pub struct DeviceAdvertisement {
   pub process_id: u16,

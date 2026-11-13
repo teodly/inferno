@@ -97,6 +97,17 @@ impl Connection {
     opcode2: u16,
     content: &[u8],
   ) {
+    // make_packet asserts the packet fits the buffer; a response built from
+    // network-supplied data must never take the server (and, in the ALSA
+    // plugin, the host process) down with it.
+    if content.len() + HEADER_LENGTH > self.send_buff.len() {
+      error!(
+        "dropping {} byte response to opcode {opcode1:#06x}: larger than the {} byte send buffer",
+        content.len() + HEADER_LENGTH,
+        self.send_buff.len()
+      );
+      return;
+    }
     let pkt = make_packet(&mut self.send_buff, start_code, seqnum, opcode1, opcode2, content);
     self.server.send(&dst, pkt).await;
   }

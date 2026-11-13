@@ -1,6 +1,6 @@
 use super::samples_utils::*;
 use crate::device_info::DeviceInfo;
-use crate::device_server::TransferNotifier;
+use crate::device_server::{NotifyThrottle, TransferNotifier};
 use crate::net_utils::MTU;
 use crate::ring_buffer::{ProxyToSamplesBuffer, RBInput, RingBufferShared};
 use crate::util::os::set_current_thread_realtime;
@@ -54,6 +54,10 @@ struct SocketData<P: ProxyToSamplesBuffer> {
 struct SilenceWriter<P: ProxyToSamplesBuffer> {
   sink: RBInput<Sample, P>,
   end_timestamp: Clock,
+  /// The disconnected channel's timestamp_shift: received samples were
+  /// written this far ahead of the media clock (start offset + latency), and
+  /// the silence must be written as far ahead, or the reader overtakes it.
+  timestamp_shift: ClockDiff,
 }
 
 enum Command<P: ProxyToSamplesBuffer> {
@@ -132,6 +136,10 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             let audio_bytes = &buf[9..recv_size];
 
             let stride = num_channels * sd.bytes_per_sample;
+            if stride == 0 || !(2..=4).contains(&sd.bytes_per_sample) {
+              // add_socket refuses such flows; never divide by zero or panic in this thread
+              return Command::NoOp;
+            }
             let samples_count = audio_bytes.len() / stride;
             //info!("first byte = {}, assuming {} samples in {} channels", buf[0], samples_count, num_channels);
             for (i, ch) in sd.channels.iter_mut().enumerate() {
@@ -148,9 +156,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                     2 => sink.write_from_at(ts as usize, S16ReaderIterator(reader)),
                     3 => sink.write_from_at(ts as usize, S24ReaderIterator(reader)),
                     4 => sink.write_from_at(ts as usize, S32ReaderIterator(reader)),
-                    other => {
-                      panic!("unsupported bytes per sample {}", other);
-                    }
+                    _ => unreachable!("bytes per sample checked above"),
                   };
                 });
               }
@@ -173,6 +179,50 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
   async fn take_command(receiver: &mut mpsc::Receiver<Command<P>>) -> Command<P> {
     receiver.recv().await.unwrap_or(Command::Shutdown)
   }
+  /// Takes over a disconnected sink and writes silence into it until the
+  /// reader has passed everything the channel had buffered.
+  fn start_silence_writer(&mut self, sink: RBInput<Sample, P>, timestamp_shift: ClockDiff) {
+    if let Some(now) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
+      let rb_size = sink.ring_buffer_size();
+      self.silence_writers.push(SilenceWriter {
+        sink,
+        end_timestamp: now.wrapping_add(rb_size + rb_size / 2 /*TODO: ???*/).wrapping_add_signed(timestamp_shift),
+        timestamp_shift,
+      });
+    } else {
+      warn!("no media clock, unable to initialize SilenceWriter");
+    }
+  }
+
+  /// Applies a newly learned start time to everything connected before it:
+  /// each channel's timestamp_shift, and the position of each sink's ring
+  /// buffer (reset as a fresh connect would be), so the positions,
+  /// hole closing and SilenceWriters all use the same timeline.
+  fn rebase_to_start_time(&mut self, start_time: Clock) {
+    let now = self.clock.wrapping_now_in_timebase(self.sample_rate.into());
+    for socket_data in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
+      for channel in socket_data.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
+        channel.timestamp_shift = (0 as ClockDiff)
+          .wrapping_sub_unsigned(start_time)
+          .wrapping_add_unsigned(channel.latency_samples.try_into().unwrap());
+        if let Some(now) = now {
+          for sink in &channel.sinks {
+            sink.shared().reset(now.wrapping_add_signed(channel.timestamp_shift));
+          }
+        }
+      }
+    }
+    // Writers that exist now were started before the start time was known,
+    // so their shift and end lack the -start_time term: same rebase.
+    for sw in &mut self.silence_writers {
+      sw.timestamp_shift = sw.timestamp_shift.wrapping_sub_unsigned(start_time);
+      sw.end_timestamp = sw.end_timestamp.wrapping_sub(start_time);
+      if let Some(now) = now {
+        sw.sink.shared().reset(now.wrapping_add_signed(sw.timestamp_shift));
+      }
+    }
+  }
+
   fn run(&mut self, mut start_time_rx: Option<tokio::sync::oneshot::Receiver<Clock>>) {
     let keepalive_interval_between_flows = KEEPALIVE_INTERVAL / self.sockets.len().try_into().unwrap();
     let mut next_keepalive = Instant::now() + keepalive_interval_between_flows;
@@ -188,9 +238,31 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
       })
       .unwrap_or(CLOSING_SAMPLES_INTERVAL);
     let mut next_closing_samples = Instant::now() + closing_samples_interval;
+    // How far ahead of the media clock holes are closed. With an external
+    // buffer (the ALSA plugin) the application reads the ring directly, up
+    // to about ts, and moves on by one closing interval between closing
+    // ticks; closing only up to ts let each read run past the last close
+    // into slots still holding audio from one ring-buffer cycle earlier
+    // (teodly/inferno#41: clicks when a flow stops or is disconnected). Two
+    // intervals of lead keep the reader behind the close. Closing ahead
+    // cannot destroy audio: items already written are kept, and a packet
+    // arriving for a closed slot still overwrites it. Readers of an owned
+    // buffer (inferno2pipe) are gated by readable_pos instead and never see
+    // unclosed slots, so they keep the original behaviour (no lead), which
+    // also keeps readable_pos from running ahead of received data.
+    let closing_lead_samples: usize = if self.on_transfer.is_some() {
+      ((closing_samples_interval.as_nanos() * 2 * self.sample_rate as u128) / 1_000_000_000) as usize
+    } else {
+      0
+    };
     let mut events = mio::Events::with_capacity(MAX_FLOWS + 1); // +1 because of waker, TODO: really necessary?
     let mut may_have_command = false;
     let mut start_timestamp = None;
+    // Received samples are written only once the start time is known: ring
+    // buffer positions count from it (ALSA starts counting from 0).
+    let mut awaiting_start = start_time_rx.is_some();
+    let mut notify =
+      self.on_transfer.as_ref().map(|t| NotifyThrottle::new(t.max_interval_samples, self.sample_rate));
 
     set_current_thread_realtime(80);
     loop {
@@ -210,40 +282,39 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
         }
       }
 
+      // Learn the start time before handling any command. It used to be
+      // checked only when a network packet arrived, so a ConnectChannel
+      // handled before the first packet reset its ring buffer on the
+      // absolute media-clock timeline. Correcting timestamp_shift later did
+      // not move that position: the channel's hole closing and its
+      // SilenceWriter then worked on the wrong timeline, and after a
+      // disconnect the reader replayed the buffer's last cycle forever
+      // (teodly/inferno#41). Which channels were hit depended on whether
+      // their connect raced the first packet.
+      if let Some(rx) = &mut start_time_rx {
+        match rx.try_recv() {
+          Ok(start_time) => {
+            start_timestamp = Some(start_time);
+            start_time_rx = None;
+            awaiting_start = false;
+            self.rebase_to_start_time(start_time);
+          }
+          Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+          Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            // The stream stopped before it started (plugin_stop drops the
+            // sender). This used to panic the realtime receive thread.
+            // There is no timeline to write on, so keep writes disabled.
+            warn!("start time channel closed before a start time arrived; not writing received samples");
+            start_time_rx = None;
+          }
+        }
+      }
+
       for event in &events {
         if event.token() == WAKE_TOKEN {
           may_have_command = true;
         } else {
           // received a packet from the network
-          if let Some(rx) = &mut start_time_rx {
-            // need to get start time to compute (ringbuffer_position - media_clock) difference
-            // (because ALSA starts counting from 0)
-            match rx.try_recv() {
-              Ok(start_time) => {
-                start_timestamp = Some(start_time);
-                for socket_opt in &mut self.sockets {
-                  if let Some(socket_data) = socket_opt {
-                    for channel_opt in &mut socket_data.channels {
-                      if let Some(channel) = channel_opt {
-                        channel.timestamp_shift = (0 as ClockDiff)
-                          .wrapping_sub_unsigned(start_time)
-                          .wrapping_add_unsigned(channel.latency_samples.try_into().unwrap())
-                          as ClockDiff;
-                        // FIXME DRY
-                      }
-                    }
-                  }
-                }
-              }
-              Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
-              Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                panic!("channel closed, unable to get start timestamp for ring buffer input");
-              }
-            }
-          }
-          if start_timestamp.is_some() {
-            start_time_rx = None;
-          }
           let socket_index = event.token().0;
           if let Some(socket_data) = &mut self.sockets[socket_index] {
             // always run receive to prevent network queue fill when waiting for start_time_rx
@@ -253,16 +324,18 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
               self.sample_rate,
               &mut self.clock,
               self.ref_instant,
-              start_time_rx.is_none(),
+              !awaiting_start,
             );
           } else {
             warn!("got token not bound to any existing socket");
           }
         }
       }
-      //if start_time_rx.is_none() {
-      self.on_transfer.as_ref().map(|transfer| (transfer.callback)());
-      //} XXX
+      if let Some(transfer) = self.on_transfer.as_ref() {
+        if notify.as_mut().is_some_and(|n| n.due(Instant::now())) {
+          (transfer.callback)();
+        }
+      }
 
       if may_have_command {
         match self.commands_receiver.try_recv() {
@@ -282,21 +355,21 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
             Command::RemoveSocket { index } => {
               self.poll.registry().deregister(&mut self.sockets[index].as_mut().unwrap().socket).unwrap();
               let socket = self.sockets[index].take().unwrap();
-              if cfg!(debug_assertions) {
-                let count: usize = socket
-                  .channels
-                  .iter()
-                  .filter_map(|ch_opt| ch_opt.as_ref())
-                  .map(|ch| ch.sinks.len())
-                  .sum();
-                if count > 0 {
-                  error!(
-                    "BUG: still have {} channels when removing socket index {index}",
-                    socket.channels.len()
-                  );
+              // A channel's DisconnectChannel is sent from a spawned task
+              // (ExternalBuffering::disconnect_channel), so when the last
+              // channel of a flow is unsubscribed this RemoveSocket can
+              // arrive first. Dropping the socket then dropped the sinks
+              // with it: no SilenceWriter ever ran, the late disconnect
+              // found no socket, and the reader replayed the ring buffer's
+              // last cycle forever (teodly/inferno#41). Silence any sink
+              // still attached, exactly as a disconnect would.
+              for ch in socket.channels.into_iter().flatten() {
+                let shift = ch.timestamp_shift;
+                for sink in ch.sinks {
+                  debug!("socket {index} removed with a channel still connected; silencing it");
+                  self.start_silence_writer(sink, shift);
                 }
               }
-              let _ = socket;
             }
             Command::ConnectChannel { socket_index, channel_in_flow, sink } => {
               if cfg!(debug_assertions) {
@@ -351,18 +424,8 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
                     ch.sinks.iter().position(|sink| Arc::ptr_eq(sink.shared(), &rb_shared));
                   if let Some(sink_index) = sink_index_opt {
                     let sink = ch.sinks.swap_remove(sink_index);
-                    if let Some(now) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
-                      let rb_size = sink.ring_buffer_size();
-                      let writer = SilenceWriter {
-                        sink,
-                        end_timestamp: now
-                          .wrapping_add(rb_size + rb_size / 2 /*TODO: ???*/)
-                          .wrapping_add_signed(ch.timestamp_shift),
-                      };
-                      self.silence_writers.push(writer);
-                    } else {
-                      warn!("no media clock, unable to initialize SilenceWriter");
-                    }
+                    let shift = ch.timestamp_shift;
+                    self.start_silence_writer(sink, shift);
                   }
                 }
               }
@@ -380,7 +443,7 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
 
       let now = Instant::now();
 
-      if start_time_rx.is_none() && now >= next_closing_samples {
+      if !awaiting_start && now >= next_closing_samples {
         if let Some(now_ts) = self.clock.wrapping_now_in_timebase(self.sample_rate.into()) {
           let ts = now_ts.wrapping_sub(start_timestamp.unwrap_or(0));
 
@@ -389,15 +452,28 @@ impl<P: ProxyToSamplesBuffer> FlowsReceiverInternal<P> {
           // However, if the stream breaks, it will ensure that buffer is filled with zeros
           for sd in self.sockets.iter_mut().filter_map(|opt| opt.as_mut()) {
             for ch in sd.channels.iter_mut().filter_map(|opt| opt.as_mut()) {
+              let until = ts.wrapping_add(closing_lead_samples);
               for sink in &mut ch.sinks {
-                sink.close_items_until(ts);
+                sink.close_items_until(until);
               }
             }
           }
 
           let mut finished = None;
           for (index, sw) in self.silence_writers.iter_mut().enumerate() {
-            sw.sink.close_items_until(ts);
+            // Silence a disconnected channel up to where received samples
+            // would have been written by now (media clock + timestamp_shift,
+            // i.e. ts + latency), not just up to ts. The reader consumes up
+            // to ~ts between closing ticks; when the silence stopped at ts,
+            // each read ran a few samples past the last tick into slots
+            // still holding audio from one ring-buffer cycle earlier, and
+            // played them as clicks until the writer finished
+            // (teodly/inferno#41). Zeroing ahead never removes the real
+            // tail: close_items_until keeps already-written items and only
+            // fills unconditionally beyond the last write.
+            sw.sink.close_items_until(
+              now_ts.wrapping_add_signed(sw.timestamp_shift).wrapping_add(closing_lead_samples),
+            );
             if wrapped_diff(ts, sw.end_timestamp) >= 0 {
               finished = Some(index);
             }
@@ -539,6 +615,14 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
   ) {
     // TODO: it would be more logical to move socket creation here from channels_subscriber.rs which is already convoluted
     debug!("adding flow receiver local index={local_index}");
+    // the format comes from the transmitter's advertisement: refuse what the
+    // receive thread cannot parse instead of letting it panic there
+    if local_index >= MAX_FLOWS || !(2..=4).contains(&bytes_per_sample) || channels_count == 0 {
+      error!(
+        "refusing flow receiver index={local_index}: {bytes_per_sample} bytes per sample, {channels_count} channels"
+      );
+      return;
+    }
     let empty_sinks_vecs = (0..channels_count)
       .map(|_| {
         let mut v = vec![];
@@ -591,8 +675,20 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
 
     {
       let mut flows_info = self.flows_info.write().unwrap();
-      flows_info[local_flow_index].as_mut().unwrap().channels_map[channel_in_flow]
-        .set(local_channel_index, true);
+      let slot = flows_info
+        .get_mut(local_flow_index)
+        .and_then(Option::as_mut)
+        .and_then(|flow| flow.channels_map.get_mut(channel_in_flow))
+        .filter(|_| local_channel_index < self.max_channels);
+      match slot {
+        Some(map) => {
+          map.set(local_channel_index, true);
+        }
+        None => {
+          error!("connect_channel: no channel {channel_in_flow} in flow index {local_flow_index} (local channel {local_channel_index})");
+          return;
+        }
+      }
     }
 
     self
@@ -613,8 +709,20 @@ impl<P: ProxyToSamplesBuffer + Send + Sync + 'static> FlowsReceiver<P> {
 
     {
       let mut flows_info = self.flows_info.write().unwrap();
-      flows_info[local_flow_index].as_mut().unwrap().channels_map[channel_in_flow]
-        .set(local_channel_index, false);
+      let slot = flows_info
+        .get_mut(local_flow_index)
+        .and_then(Option::as_mut)
+        .and_then(|flow| flow.channels_map.get_mut(channel_in_flow))
+        .filter(|_| local_channel_index < self.max_channels);
+      match slot {
+        Some(map) => {
+          map.set(local_channel_index, false);
+        }
+        None => {
+          error!("disconnect_channel: no channel {channel_in_flow} in flow index {local_flow_index} (local channel {local_channel_index})");
+          return;
+        }
+      }
     }
 
     self

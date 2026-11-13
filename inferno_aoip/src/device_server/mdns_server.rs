@@ -19,6 +19,7 @@ use crate::{
 pub struct DeviceMDNSResponder {
   handle: RwLock<Option<BroadcasterHandle>>,
   self_info: Arc<DeviceInfo>,
+  tx_latency_ns: u32,
   self_origin: Vec<u8>,
   multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>>,
 }
@@ -46,6 +47,7 @@ fn multicast_ip_to_name(addr: Ipv4Addr) -> Name {
 impl DeviceMDNSResponder {
   pub fn start(
     self_info: Arc<DeviceInfo>,
+    tx_latency_ns: u32,
     multicasts_by_channel: Arc<RwLock<BTreeMap<usize, PointerToMulticast>>>,
   ) -> Self {
     let hostname = Name::from_labels([self_info.friendly_hostname.as_bytes()]).unwrap();
@@ -90,12 +92,33 @@ impl DeviceMDNSResponder {
       handle: RwLock::new(Some(handle)),
       self_origin: self_origin_from_self_info(&self_info),
       self_info,
+      tx_latency_ns,
       multicasts_by_channel,
+    }
+  }
+
+  /// `<label>@<hostname>` as a single DNS label. Channel labels come from rename
+  /// requests and saved state; a label over 63 bytes is refused (logged), not unwrapped.
+  fn instance_name(&self, label: &str) -> Option<Name> {
+    let instance = format!("{}@{}", label, self.self_info.friendly_hostname);
+    match Name::from_labels([instance.as_bytes()]) {
+      Ok(name) => Some(name),
+      Err(e) => {
+        log::error!("cannot advertise {instance:?}: {e}");
+        None
+      }
     }
   }
 
   pub fn add_tx_channel(&self, index: usize) {
     let self_info = &*self.self_info;
+    let txch = match self_info.tx_channels.get(index) {
+      Some(ch) => ch,
+      None => {
+        log::error!("trying to advertise nonexisting TX channel index {index}");
+        return;
+      }
+    };
     let bundle = self
       .multicasts_by_channel
       .read()
@@ -103,10 +126,12 @@ impl DeviceMDNSResponder {
       .get(&index)
       .map(|p| format!("b.{}={}", p.bundle_id, p.channel_in_bundle + 1));
     let service = |ch_name: &str, default: bool| {
-      let name =
-        Name::from_labels([format!("{}@{}", ch_name, self_info.friendly_hostname).as_bytes()]).unwrap();
-      let mut b = ServiceBuilder::new(service_type("_netaudio-chan"), name, self_info.flows_control_port)
-        .unwrap()
+      let name = self.instance_name(ch_name)?;
+      let builder =
+        ServiceBuilder::new(service_type("_netaudio-chan"), name, self_info.flows_control_port)
+          .map_err(|e| log::error!("cannot advertise TX channel {ch_name:?}: {e:?}"))
+          .ok()?;
+      let mut b = builder
         .add_ip_address(IpAddr::V4(self_info.ip_address))
         .add_txt_truncated("txtvers=2")
         .add_txt_truncated("dbcp1=0x1102")
@@ -116,7 +141,7 @@ impl DeviceMDNSResponder {
         .add_txt_truncated(format!("pcm={} {:x}", self_info.bits_per_sample / 8, self_info.pcm_type))
         .add_txt_truncated(kv("enc", self_info.bits_per_sample))
         .add_txt_truncated(kv("en", self_info.bits_per_sample))
-        .add_txt_truncated(kv("latency_ns", self_info.latency_ns /* FIXME should be tx latency */))
+        .add_txt_truncated(kv("latency_ns", self.tx_latency_ns))
         .add_txt_truncated(format!("fpp={},{}", FPP_MAX_ADVERTISED, FPP_MIN))
         .add_txt_truncated(kv("nchan", MAX_CHANNELS_IN_FLOW.min(self_info.tx_channels.len() as u16)));
       if default {
@@ -125,17 +150,20 @@ impl DeviceMDNSResponder {
       if let Some(s) = &bundle {
         b = b.add_txt_truncated(s.clone());
       }
-      b.build().unwrap()
+      b.build().map_err(|e| log::error!("cannot advertise TX channel {ch_name:?}: {e:?}")).ok()
     };
-    let txch = &self_info.tx_channels[index];
     let handle = self.handle.read().unwrap();
     match handle.as_ref() {
       Some(handle) => {
-        handle.add_service(service(&txch.factory_name, true)).log_and_forget();
+        if let Some(svc) = service(&txch.factory_name, true) {
+          handle.add_service(svc).log_and_forget();
+        }
         let friendly_name_locked = txch.friendly_name.read();
         let friendly_name = friendly_name_locked.unwrap();
         if txch.factory_name != *friendly_name {
-          handle.add_service(service(&friendly_name, false)).log_and_forget();
+          if let Some(svc) = service(&friendly_name, false) {
+            handle.add_service(svc).log_and_forget();
+          }
         }
       }
       None => {
@@ -147,8 +175,10 @@ impl DeviceMDNSResponder {
   pub fn remove_tx_channel(&self, index: usize) {
     let self_info = &*self.self_info;
     let remove = |ch_name: &str| {
-      let name =
-        Name::from_labels([format!("{}@{}", ch_name, self_info.friendly_hostname).as_bytes()]).unwrap();
+      let name = match self.instance_name(ch_name) {
+        Some(name) => name,
+        None => return,
+      };
       match self.handle.read().unwrap().as_ref() {
         Some(handle) => {
           handle.remove_named_service(service_type("_netaudio-chan"), name).log_and_forget();
@@ -158,7 +188,13 @@ impl DeviceMDNSResponder {
         }
       }
     };
-    let txch = &self_info.tx_channels[index];
+    let txch = match self_info.tx_channels.get(index) {
+      Some(ch) => ch,
+      None => {
+        log::error!("trying to withdraw nonexisting TX channel index {index}");
+        return;
+      }
+    };
     remove(&txch.factory_name);
     let friendly_name_locked = txch.friendly_name.read();
     let friendly_name = friendly_name_locked.unwrap();
@@ -176,23 +212,37 @@ impl DeviceMDNSResponder {
     dst_port: u16,
   ) {
     let self_info = &*self.self_info;
-    let name =
-      Name::from_labels([format!("{}@{}", bundle_id, self_info.friendly_hostname).as_bytes()]).unwrap();
+    let name = match self.instance_name(&bundle_id.to_string()) {
+      Some(name) => name,
+      None => return,
+    };
     let handle = self.handle.read().unwrap();
-    let service = ServiceBuilder::new(service_type("_netaudio-bund"), name, self_info.flows_control_port)
-      .unwrap()
+    let service =
+      match ServiceBuilder::new(service_type("_netaudio-bund"), name, self_info.flows_control_port) {
+        Ok(b) => b,
+        Err(e) => {
+          log::error!("cannot advertise multicast bundle {bundle_id}: {e:?}");
+          return;
+        }
+      }
       .add_ip_address(IpAddr::V4(self_info.ip_address))
       .add_txt_truncated("txtvers=1")
       .add_txt_truncated(kv("id", bundle_id))
       .add_txt_truncated(kv("nchan", channels_per_flow))
-      .add_txt_truncated(kv("latency_ns", self_info.latency_ns /* FIXME should be tx latency */))
+      .add_txt_truncated(kv("latency_ns", self.tx_latency_ns))
       .add_txt_truncated(kv("fpp", fpp))
       .add_txt_truncated(kv("rate", self_info.sample_rate))
       .add_txt_truncated(kv("enc", self_info.bits_per_sample))
       .add_txt_truncated(kv("a.0", dst_addr))
       .add_txt_truncated(kv("p.0", dst_port))
-      .build()
-      .unwrap();
+      .build();
+    let service = match service {
+      Ok(s) => s,
+      Err(e) => {
+        log::error!("cannot advertise multicast bundle {bundle_id}: {e:?}");
+        return;
+      }
+    };
 
     match handle.as_ref() {
       Some(handle) => {
@@ -205,9 +255,10 @@ impl DeviceMDNSResponder {
   }
 
   pub fn remove_multicast_bundle(&self, bundle_id: usize) {
-    let self_info = &*self.self_info;
-    let name =
-      Name::from_labels([format!("{}@{}", bundle_id, self_info.friendly_hostname).as_bytes()]).unwrap();
+    let name = match self.instance_name(&bundle_id.to_string()) {
+      Some(name) => name,
+      None => return,
+    };
     let handle = self.handle.read().unwrap();
     match handle.as_ref() {
       Some(handle) => {

@@ -5,9 +5,11 @@ use std::str;
 
 use bytebuffer::ByteBuffer;
 
+#[allow(non_snake_case)]
 pub fn H(u: u16) -> u8 {
   return (u >> 8) as u8;
 }
+#[allow(non_snake_case)]
 pub fn L(u: u16) -> u8 {
   return u as u8;
 }
@@ -17,15 +19,21 @@ pub fn make_u16(h: u8, l: u8) -> u16 {
 }
 
 pub fn write_str_to_buffer(buffer: &mut [u8], offset: usize, max_len: usize, s: &str) {
-  let len = min(max_len, s.len());
-  buffer[offset..offset + len].clone_from_slice(&s.as_bytes()[0..len]);
+  // Never panic on an oversized request: clamp the write to the space the
+  // buffer actually has, so a short destination (or a bad offset) just
+  // truncates instead of taking down the process.
+  let available = buffer.len().saturating_sub(offset);
+  let len = min(max_len, s.len()).min(available);
+  if len > 0 {
+    buffer[offset..offset + len].clone_from_slice(&s.as_bytes()[0..len]);
+  }
 }
 
 pub fn write_0term_str_to_bytebuffer(bytes: &mut ByteBuffer, s: &str) -> u16 {
   let offset = bytes.get_wpos();
   bytes.write_bytes(s.as_bytes());
   bytes.write_u8(0);
-  return offset.try_into().unwrap();
+  return offset.min(u16::MAX as usize) as u16;
 }
 
 pub fn write_0term_str_or_0_to_bytebuffer(bytes: &mut ByteBuffer, s: Option<&str>) -> u16 {
@@ -37,6 +45,9 @@ pub fn write_0term_str_or_0_to_bytebuffer(bytes: &mut ByteBuffer, s: Option<&str
 }
 
 pub fn align_wpos(bytes: &mut ByteBuffer, alignment: usize) {
+  if alignment == 0 {
+    return;
+  }
   while (bytes.get_wpos() % alignment) != 0 {
     bytes.write_u8(0);
   }
@@ -181,5 +192,51 @@ mod tests {
   fn test_read_0term_str_from_buffer_offset_past_end() {
     let buf = b"hi";
     assert!(read_0term_str_from_buffer(buf, 5).is_err());
+  }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+
+  #[test]
+  fn write_str_to_buffer_short_destination_does_not_panic() {
+    let mut buf = [0u8; 2];
+    write_str_to_buffer(&mut buf, 0, 5, "hello");
+    assert_eq!(&buf, b"he");
+  }
+
+  #[test]
+  fn write_str_to_buffer_offset_past_end_does_not_panic() {
+    let mut buf = [0u8; 2];
+    write_str_to_buffer(&mut buf, 5, 3, "abc");
+    assert_eq!(&buf, &[0, 0]);
+  }
+
+  #[test]
+  fn write_str_to_buffer_zero_max_len_writes_nothing() {
+    let mut buf = [0u8; 3];
+    write_str_to_buffer(&mut buf, 0, 0, "abc");
+    assert_eq!(&buf, &[0, 0, 0]);
+  }
+
+  #[test]
+  fn align_wpos_zero_alignment_does_not_panic() {
+    let mut bytes = ByteBuffer::new();
+    bytes.write_u8(7);
+    align_wpos(&mut bytes, 0);
+    assert_eq!(bytes.get_wpos(), 1);
+  }
+
+  #[test]
+  fn read_0term_str_offset_at_last_byte() {
+    let buf = b"a\0";
+    assert_eq!(read_0term_str_from_buffer(buf, 1).unwrap(), "");
+  }
+
+  #[test]
+  fn make_u16_extremes() {
+    assert_eq!(make_u16(0, 0), 0);
+    assert_eq!(make_u16(0xFF, 0xFF), 0xFFFF);
   }
 }

@@ -35,16 +35,29 @@ impl UdpSocketWrapper {
     let listen_addr = listen_addr.unwrap_or(Ipv4Addr::new(0, 0, 0, 0));
     let socket_opt =
       UdpSocket::bind(SocketAddr::new(std::net::IpAddr::V4(listen_addr), listen_port)).await;
-    let socket = socket_opt.expect("error starting really needed listener");
-    // TODO MAY PANIC: this error should be non-fatal because some apps may use Inferno as an optional audio I/O
-    let listen_port = socket.local_addr().unwrap().port();
-    UdpSocketWrapper {
-      listen_addr,
-      socket: Some(socket),
-      listen_port,
-      shutdown,
-      dowork: true,
-      recv_buff: [0; PACKET_BUFFER_SIZE],
+    match socket_opt {
+      Ok(socket) => {
+        let listen_port = socket.local_addr().map(|a| a.port()).unwrap_or(listen_port);
+        UdpSocketWrapper {
+          listen_addr,
+          socket: Some(socket),
+          listen_port,
+          shutdown,
+          dowork: true,
+          recv_buff: [0; PACKET_BUFFER_SIZE],
+        }
+      }
+      Err(e) => {
+        error!("error starting listener on {listen_addr}:{listen_port}: {e}");
+        UdpSocketWrapper {
+          listen_addr,
+          socket: None,
+          listen_port,
+          shutdown,
+          dowork: false,
+          recv_buff: [0; PACKET_BUFFER_SIZE],
+        }
+      }
     }
   }
 

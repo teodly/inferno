@@ -50,17 +50,18 @@ pub struct MulticastMessage {
 pub fn make_channel_change_notification(
   channel_indices: impl IntoIterator<Item = usize>,
 ) -> MulticastMessage {
-  let mut content = vec![0u8; 3];
+  // Size the buffer once from the largest channel index instead of
+  // resizing repeatedly.
+  let indices: Vec<usize> = channel_indices.into_iter().collect();
+  let max_byte = indices.iter().map(|ch| ch / 8).max().unwrap_or(0);
+  let mut content = vec![0u8; 2 + max_byte + 1];
   let offset = 2;
-  for ch in channel_indices {
-    let byte = ch / 8;
-    let bit = ch % 8;
-    if byte >= (content.len() - offset) {
-      content.resize(byte + offset + 1, 0);
-    }
+  for ch in &indices {
+    let byte = *ch / 8;
+    let bit = *ch % 8;
     content[byte + offset] |= 1 << bit;
   }
-  let mask_len = (content.len() - 2).try_into().unwrap();
+  let mask_len = (content.len() - 2).min(u16::MAX as usize) as u16;
   content[0] = H(mask_len);
   content[1] = L(mask_len);
   MulticastMessage { start_code: 0xffff, opcode: [0x07, 0x2a, 1, 2, 0, 0, 0, 0], content }
@@ -114,5 +115,44 @@ mod tests {
     let msg = make_channel_change_notification([42]);
     assert_eq!(msg.start_code, 0xffff);
     assert_eq!(msg.opcode, [0x07, 0x2a, 1, 2, 0, 0, 0, 0]);
+  }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+  use super::*;
+
+  #[test]
+  fn notification_channel_index_7_sets_high_bit_of_first_byte() {
+    let msg = make_channel_change_notification([7]);
+    // content: [mask_len_hi, mask_len_lo, byte0...], mask_len=1
+    assert_eq!(msg.content[0], 0);
+    assert_eq!(msg.content[1], 1);
+    assert_eq!(msg.content[2], 1 << 7);
+  }
+
+  #[test]
+  fn notification_channel_index_8_resizes_and_sets_bit() {
+    let msg = make_channel_change_notification([8]);
+    // needs 2 content bytes after the 2-byte length: indices 0 and 1 -> 2 bytes
+    assert_eq!(msg.content[0], 0);
+    assert_eq!(msg.content[1], 2);
+    assert_eq!(msg.content[2], 0);
+    assert_eq!(msg.content[3], 1);
+  }
+
+  #[test]
+  fn notification_multiple_and_duplicate_channels() {
+    let msg = make_channel_change_notification([0, 0, 1]);
+    assert_eq!(msg.content[0], 0);
+    assert_eq!(msg.content[1], 1);
+    assert_eq!(msg.content[2], (1 << 0) | (1 << 1));
+  }
+
+  #[test]
+  fn notification_large_index_does_not_panic() {
+    // Should not panic; allocation may be large but 1000 is fine.
+    let msg = make_channel_change_notification([1000]);
+    assert!(msg.content.len() >= 2);
   }
 }

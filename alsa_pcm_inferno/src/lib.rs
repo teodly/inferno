@@ -184,8 +184,22 @@ unsafe fn get_private<'a>(io: *mut snd_pcm_ioplug_t) -> &'a mut MyIOPlug {
     &mut *((*io).private_data as *mut MyIOPlug)
 }
 
-unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t {
+unsafe fn plugin_pointer_impl(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t {
     let this = get_private(io);
+    // ALSA may ask for the pointer before the stream was ever prepared
+    // (snd_pcm_status/snd_pcm_avail right after open - JACK does, see
+    // teodly/inferno#8). There is no stream yet, so nothing has moved.
+    // Unwrapping stream_info here panicked, and a panic in an extern "C"
+    // callback aborts the host process.
+    let Some(boundary_u) = this.stream_info.as_ref().map(|si| si.boundary) else {
+        return 0;
+    };
+    // boundary comes from ALSA as unsigned; ALSA keeps it within the signed
+    // range, but a value that does not fit must not panic either.
+    let Ok(boundary) = snd_pcm_sframes_t::try_from(boundary_u) else {
+        error!("boundary {boundary_u} does not fit in a signed frame count, reporting xrun");
+        return -(EPIPE as snd_pcm_sframes_t);
+    };
     let cur = this
         .current_timestamp
         .load(Ordering::SeqCst /*TODO: really needed?*/);
@@ -232,13 +246,6 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
         //now_samples_opt.map(|now_samples| now_samples.wrapping_sub(this.start_time.unwrap())).unwrap_or(0) as i64
     };
 
-    let boundary: snd_pcm_sframes_t = this
-        .stream_info
-        .as_ref()
-        .unwrap()
-        .boundary
-        .try_into()
-        .unwrap();
     let max_diff = boundary >> 2;
     let appl_ptr = ((*io).appl_ptr as snd_pcm_sframes_t)
         .wrapping_add(this.stream_info.as_ref().unwrap().boundary_add.0);
@@ -295,6 +302,73 @@ unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframe
     ptr
 }
 
+// --- FFI panic guard -------------------------------------------------------
+//
+// Every entry point ALSA calls is an extern "C" function, and a Rust panic
+// cannot unwind out of one: it aborts the whole host process ("panic in a
+// function that cannot unwind", teodly/inferno#8). The host is whatever
+// application opened the PCM - a DAW, JACK, PipeWire, a recorder - and one
+// unwrap() on a dead channel or a poisoned lock inside the plugin took it
+// down. ffi_guard turns a panic in a callback into an error return, so ALSA
+// reports a failed call (or an xrun, for the pointer) and the host carries on.
+
+fn ffi_guard<R>(name: &str, on_panic: R, f: impl FnOnce() -> R) -> R {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            error!("panic in ALSA callback {name}: {msg}; returning an error instead of aborting the host");
+            on_panic
+        }
+    }
+}
+
+unsafe extern "C" fn plugin_pointer(io: *mut snd_pcm_ioplug_t) -> snd_pcm_sframes_t {
+    ffi_guard("plugin_pointer", -(EPIPE as snd_pcm_sframes_t), || unsafe { plugin_pointer_impl(io) })
+}
+
+unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
+    ffi_guard("plugin_prepare", -libc::EIO, || unsafe { plugin_prepare_impl(io) })
+}
+
+unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
+    ffi_guard("plugin_start", -libc::EIO, || unsafe { plugin_start_impl(io) })
+}
+
+unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
+    ffi_guard("plugin_stop", -libc::EIO, || unsafe { plugin_stop_impl(io) })
+}
+
+unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
+    ffi_guard("plugin_close", -libc::EIO, || unsafe { plugin_close_impl(io) })
+}
+
+unsafe extern "C" fn plugin_demangle_revents(
+    io: *mut snd_pcm_ioplug_t,
+    pfd: *mut libc::pollfd,
+    nfds: ::std::os::raw::c_uint,
+    revents: *mut ::std::os::raw::c_ushort,
+) -> ::std::os::raw::c_int {
+    ffi_guard("plugin_demangle_revents", -libc::EIO, || unsafe {
+        plugin_demangle_revents_impl(io, pfd, nfds, revents)
+    })
+}
+
+unsafe extern "C" fn plugin_transfer(
+    io: *mut snd_pcm_ioplug_t,
+    areas: *const snd_pcm_channel_area_t,
+    offset: snd_pcm_uframes_t,
+    size: snd_pcm_uframes_t,
+) -> snd_pcm_sframes_t {
+    ffi_guard("plugin_transfer", -(libc::EIO as snd_pcm_sframes_t), || unsafe {
+        plugin_transfer_impl(io, areas, offset, size)
+    })
+}
+
 fn get_app_name() -> Option<String> {
     Some(
         std::env::current_exe()
@@ -305,7 +379,7 @@ fn get_app_name() -> Option<String> {
     )
 }
 
-unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
+unsafe fn plugin_prepare_impl(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_prepare called");
 
     let this = get_private(io);
@@ -472,7 +546,7 @@ unsafe extern "C" fn plugin_prepare(io: *mut snd_pcm_ioplug_t) -> c_int {
     0
 }
 
-unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
+unsafe fn plugin_start_impl(io: *mut snd_pcm_ioplug_t) -> c_int {
     let appl_ptr = (*io).appl_ptr as snd_pcm_sframes_t;
     debug!("plugin_start called with appl_ptr: {appl_ptr}");
     let this = get_private(io);
@@ -518,7 +592,7 @@ unsafe extern "C" fn plugin_start(io: *mut snd_pcm_ioplug_t) -> c_int {
     0
 }
 
-unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
+unsafe fn plugin_stop_impl(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_stop called");
 
     let this = get_private(io);
@@ -565,7 +639,7 @@ unsafe extern "C" fn plugin_stop(io: *mut snd_pcm_ioplug_t) -> c_int {
     0
 }
 
-unsafe extern "C" fn plugin_demangle_revents(
+unsafe fn plugin_demangle_revents_impl(
     io: *mut snd_pcm_ioplug_t,
     pfd: *mut libc::pollfd,
     nfds: ::std::os::raw::c_uint,
@@ -593,7 +667,7 @@ unsafe extern "C" fn plugin_demangle_revents(
     0
 }
 
-unsafe extern "C" fn plugin_transfer(
+unsafe fn plugin_transfer_impl(
     io: *mut snd_pcm_ioplug_t,
     areas: *const snd_pcm_channel_area_t,
     offset: snd_pcm_uframes_t,
@@ -609,7 +683,7 @@ unsafe extern "C" fn plugin_transfer(
     size as snd_pcm_sframes_t
 }
 
-unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
+unsafe fn plugin_close_impl(io: *mut snd_pcm_ioplug_t) -> c_int {
     debug!("plugin_close called");
     let this = get_private(io);
     drop(this.start_time_tx.take());
@@ -634,7 +708,7 @@ unsafe extern "C" fn plugin_close(io: *mut snd_pcm_ioplug_t) -> c_int {
     0
 }
 
-unsafe extern "C" fn plugin_define(
+unsafe fn plugin_define(
     pcmp: *mut *mut snd_pcm_t,
     name: *const c_char,
     root: *const snd_config_t,
@@ -649,7 +723,10 @@ unsafe extern "C" fn plugin_define(
             env_logger::builder()
                 .parse_env(logenv)
                 .format_timestamp_micros()
-                .init();
+                // try_init: a host that already installed a `log` logger
+                // made init() panic inside open.
+                .try_init()
+                .ok();
             *locked_flag = true;
         }
     }
@@ -876,8 +953,31 @@ pub extern "C" fn _snd_pcm_inferno_open(
     stream: snd_pcm_stream_t,
     mode: c_int,
 ) -> c_int {
-    unsafe { plugin_define(pcmp, name, root, conf, stream, mode) }
+    ffi_guard("open", -libc::EIO, || unsafe { plugin_define(pcmp, name, root, conf, stream, mode) })
 }
 
 #[no_mangle]
 pub extern "C" fn __snd_pcm_inferno_open_dlsym_pcm_001() {}
+
+#[cfg(test)]
+mod tests {
+    use super::ffi_guard;
+
+    #[test]
+    fn ffi_guard_passes_results_through() {
+        assert_eq!(ffi_guard("test", -5, || 42), 42);
+    }
+
+    #[test]
+    fn ffi_guard_turns_panics_into_the_error_value() {
+        // Without the guard this panic would cross an extern "C" boundary
+        // and abort the host process.
+        let r = ffi_guard("test", -5, || -> i32 { panic!("boom") });
+        assert_eq!(r, -5);
+        let r = ffi_guard("test", -5, || -> i32 {
+            let none: Option<i32> = None;
+            none.unwrap()
+        });
+        assert_eq!(r, -5);
+    }
+}

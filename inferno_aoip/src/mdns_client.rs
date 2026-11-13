@@ -43,6 +43,34 @@ pub struct AdvertisedBundle {
   pub media_addr: SocketAddr,
 }
 
+/// Upper bounds for values a remote transmitter advertises. They size per-flow
+/// allocations and latency arithmetic on the receiving side.
+pub const MAX_ADVERTISED_CHANNELS_PER_FLOW: usize = 64;
+pub const MAX_ADVERTISED_LATENCY_NS: usize = 1_000_000_000;
+
+/// Rejects an advertised media format the receiver cannot handle. Values come
+/// from mDNS TXT records of any device on the network.
+pub fn check_advertised_format(
+  channels_per_flow: usize,
+  bits_per_sample: u32,
+  min_rx_latency_ns: usize,
+) -> Result<(), io::Error> {
+  let bad = |what: String| {
+    error!("ignoring advertisement: {what}");
+    Err(io::Error::new(io::ErrorKind::InvalidData, what))
+  };
+  if !matches!(bits_per_sample, 16 | 24 | 32) {
+    return bad(format!("unsupported encoding {bits_per_sample}"));
+  }
+  if channels_per_flow == 0 || channels_per_flow > MAX_ADVERTISED_CHANNELS_PER_FLOW {
+    return bad(format!("nchan={channels_per_flow}"));
+  }
+  if min_rx_latency_ns > MAX_ADVERTISED_LATENCY_NS {
+    return bad(format!("latency_ns={min_rx_latency_ns}"));
+  }
+  Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct AdvertisedChannel {
   pub addr: SocketAddr,
@@ -132,7 +160,8 @@ impl MdnsClient {
             return Ok(true);
           }
         }
-        Ok(true)
+        // a response that answers some other name is not this record
+        Ok(false)
       }
       Err(_e) => Ok(false), // TODO: sometimes error may be other than timeout, handle that
     }
@@ -277,7 +306,7 @@ impl MdnsClient {
       .ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?
       .split_once(",")
       .ok_or(Box::new(io::Error::from(io::ErrorKind::InvalidData)))?;
-    return Ok(AdvertisedChannel {
+    let channel = AdvertisedChannel {
       addr: result.addr,
       tx_channels_per_flow: parse_int("nchan")?,
       tx_channel_id: parse_int("id")? as u16,
@@ -287,7 +316,17 @@ impl MdnsClient {
       fpp_max: fpp1.parse()?,
       min_rx_latency_ns: parse_int("latency_ns")?,
       multicast,
-    });
+    };
+    check_advertised_format(
+      channel.tx_channels_per_flow,
+      channel.bits_per_sample,
+      channel.min_rx_latency_ns,
+    )?;
+    if channel.fpp_min == 0 || channel.fpp_max < channel.fpp_min {
+      error!("ignoring advertisement of {full_name}: fpp={fpp1},{fpp2}");
+      return Err(Box::new(io::Error::from(io::ErrorKind::InvalidData)));
+    }
+    return Ok(channel);
   }
 
   pub async fn query_bund(&self, full_name: &str) -> Result<AdvertisedBundle, Box<dyn Error>> {
@@ -300,13 +339,44 @@ impl MdnsClient {
     let port =
       result.properties.get("p.0").ok_or(Box::new(io::Error::from(io::ErrorKind::NotFound)))?.parse()?;
     let media_addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-    return Ok(AdvertisedBundle {
+    let bundle = AdvertisedBundle {
       tx_channels_per_flow: parse_int("nchan")?,
       tx_bundle_id: parse_int("id")? as u16,
       bits_per_sample: parse_int("enc").or_else(|_| parse_int("en"))? as u32,
       fpp: parse_int("fpp")? as u16,
       min_rx_latency_ns: parse_int("latency_ns")?,
       media_addr,
-    });
+    };
+    check_advertised_format(
+      bundle.tx_channels_per_flow,
+      bundle.bits_per_sample,
+      bundle.min_rx_latency_ns,
+    )?;
+    if bundle.fpp == 0 {
+      error!("ignoring advertisement of {full_name}: fpp=0");
+      return Err(Box::new(io::Error::from(io::ErrorKind::InvalidData)));
+    }
+    return Ok(bundle);
+  }
+}
+
+#[cfg(test)]
+mod advert_tests {
+  use super::*;
+
+  #[test]
+  fn advertised_formats() {
+    assert!(check_advertised_format(8, 24, 1_000_000).is_ok());
+    assert!(check_advertised_format(1, 16, 0).is_ok());
+    assert!(
+      check_advertised_format(MAX_ADVERTISED_CHANNELS_PER_FLOW, 32, MAX_ADVERTISED_LATENCY_NS).is_ok()
+    );
+    // each of these reached a panic, a division by zero or an overflow on the receive side
+    assert!(check_advertised_format(0, 24, 0).is_err());
+    assert!(check_advertised_format(8, 0, 0).is_err());
+    assert!(check_advertised_format(8, 7, 0).is_err());
+    assert!(check_advertised_format(8, 40, 0).is_err());
+    assert!(check_advertised_format(MAX_ADVERTISED_CHANNELS_PER_FLOW + 1, 24, 0).is_err());
+    assert!(check_advertised_format(8, 24, usize::MAX).is_err());
   }
 }

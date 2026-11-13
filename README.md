@@ -238,6 +238,8 @@ All settings have default values. In a simple setup you should be able to start 
 * `TX_CHANNELS` - number of transmit channels, defaults to 2, will be overwritten by the application if it supports changing channels count.
 * `RX_LATENCY_NS` - receive latency in nanoseconds, i.e. how much time to wait for media packets, relatively to PTP media clock. Equivalent to latency setting in Dante Controller. Defaults to 10ms. May be removed in future versions when it becomes settable from DC and so stored in a configuration file.
 * `TX_LATENCY_NS` - transmit latency in nanoseconds, i.e. receive latency that this device will demand from devices receiving from us. Equivalent to latency setting in Dante Virtual Soundcard. Defaults to 10ms.
+  * Receivers play at the larger of their own latency and this one, and hardware receivers hold little (e.g. 1 ms): lower it (`TX_LATENCY_NS=1000000`) if one of them cannot take our flows. The 10ms default is kept because Inferno runs on a general-purpose OS; see [Set appropriate latency](#set-appropriate-latency).
+* `MAX_RX_LATENCY_NS` - the highest latency this device will subscribe at. When a transmitter demands more than this (and more than our `RX_LATENCY_NS`), the subscription is refused and Dante Controller shows the "channel latency" status instead of a flow that cannot work. Defaults to 1s, i.e. no practical limit.
 * `CLOCK_PATH` - path to either [usrvclock](https://gitlab.com/lumifaza/usrvclock) socket, or PTP device. If the latter, make sure [you are allowed](https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/78642cc53bd84c2ad529f2175cc50a658d1e52c0/src/daemon/90-pipewire-aes67-ptp.rules) to read it. Also, write permissions are required if you want to see actual frequency offset in DC. (the clock is never adjusted from within Inferno, but the syscall to read the frequency requires write access)
 
 
@@ -288,6 +290,10 @@ If you want to contribute but can't code or don't know where to start because th
 
 
 # Changelog
+
+## Unreleased
+* `MAX_RX_LATENCY_NS`: refuse subscriptions to transmitters demanding more latency than that, reporting the "channel latency" status (0x1A, unverified against Dante Controller)
+* advertise `TX_LATENCY_NS` (not `RX_LATENCY_NS`) as the latency of transmit channels and multicast flows in mDNS
 
 ## 0.5.0
 * works with JACK, should work with any app that uses the soundcard as an interrupt source
